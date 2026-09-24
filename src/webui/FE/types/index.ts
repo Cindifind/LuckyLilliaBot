@@ -12,6 +12,7 @@ export type {
   WsReverseConnectConfig,
   HttpConnectConfig,
   HttpPostConnectConfig,
+  JniConfig,
   EmailConfig,
 } from '@common/types'
 

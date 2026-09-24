@@ -73,7 +73,17 @@
         "messageFormat": "array",
         "debug": false
       }
-    ]
+    ],
+    "jni": {
+      "enable": false,
+      "javaPath": "java",
+      "jvmArgs": ["-Xmx256m"],
+      "bridgeJar": "onebot-bridge.jar",
+      "javaPluginDir": "java-plugins",
+      "classpath": [],
+      "callTimeout": 30000,
+      "reportSelfMessage": false
+    }
   },
   "enableLocalFile2Url": false,
   "log": true,

@@ -36,9 +36,30 @@ export interface HttpPostConnectConfig extends BaseConnectConfig {
   heartInterval: number // ms
 }
 
+export interface JniConfig {
+  /** 是否启用 Java 插件桥接 */
+  enable: boolean
+  /** Java 可执行文件路径，例如 java 或 /usr/bin/java */
+  javaPath: string
+  /** JVM 启动参数 */
+  jvmArgs: string[]
+  /** 桥接主程序 JAR（相对运行目录或绝对路径） */
+  bridgeJar: string
+  /** Java 插件存放目录（相对 data 目录或绝对路径） */
+  javaPluginDir: string
+  /** 额外 classpath */
+  classpath: string[]
+  /** 调用超时（毫秒） */
+  callTimeout: number
+  /** 上报自身消息：开启后机器人自己发送的消息也推送给 Java 插件 */
+  reportSelfMessage: boolean
+}
+
 export interface OB11Config {
   enable: boolean
   connect: (WsConnectConfig | WsReverseConnectConfig | HttpConnectConfig | HttpPostConnectConfig)[]
+  /** Java 插件桥接：直接在 OneBot 协议层内工作，事件/Action 复用 OneBot 11 协议 */
+  jni?: JniConfig
   // /** @deprecated */
   // token?: string
   // /** @deprecated */
@@ -133,6 +154,8 @@ export interface Config {
   autoDeleteFileSecond?: number
   ffmpeg?: string // ffmpeg路径
   musicSignUrl?: string
+  /** 自建签名服务器 URL (无头 QQ 模式). 设置后绕过 sign-proxy 原生二进制, 走 HTTP 签名. */
+  signServerUrl?: string
   msgCacheExpire?: number // second
   // /** @deprecated */
   // heartInterval?: number // ms

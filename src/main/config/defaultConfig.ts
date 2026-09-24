@@ -3,7 +3,18 @@ import { Config, MilkyConfig, OB11Config, SatoriConfig, WebUIConfig } from '@/co
 const ob11Default: OB11Config = {
   enable: true,
   connect: [
-  ]
+  ],
+  // Java 插件桥接：直接在 OneBot 协议层内工作（cleanupConfig 以此为准，缺了会删用户配置）
+  jni: {
+    enable: false,
+    javaPath: 'java',
+    jvmArgs: ['-Xmx256m'],
+    bridgeJar: 'onebot-bridge.jar',
+    javaPluginDir: 'java-plugins',
+    classpath: [],
+    callTimeout: 30000,
+    reportSelfMessage: false,
+  },
 }
 const satoriDefault: SatoriConfig = {
   enable: false,
@@ -40,6 +51,7 @@ export const defaultConfig: Config = {
   autoDeleteFile: false,
   autoDeleteFileSecond: 60,
   musicSignUrl: 'https://ss.xingzhige.com/music_card/card',
+  signServerUrl: '',
   msgCacheExpire: 120,
   ffmpeg: '',
 }

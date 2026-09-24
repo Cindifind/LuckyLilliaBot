@@ -90,6 +90,9 @@ export default defineConfig({
             // sign-proxy 版本号: pickVersion() 直接读 sign-proxy.package.json (源头就是这个名,
             // 不跟 Bot 主 package.json 撞).
             { src: './src/main/qqProtocol/direct-lib/sign-proxy/sign-proxy.package.json', dest: 'dist/' },
+            // Java 插件桥接主程序 JAR: bundle 后 llbot.js 里 import.meta.dirname 是 dist/,
+            // bridgeJar 相对路径拼出来就是 dist/onebot-bridge.jar.jar, 必须拷到 dist 根目录.
+            { src: './src/onebot11/birdge/onebot-bridge.jar', dest: 'dist/' },
           ],
         }),
       ],

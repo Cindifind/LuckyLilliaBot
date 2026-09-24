@@ -12,9 +12,10 @@ import {
 import { OB11FriendRequestEvent } from './event/request/OB11FriendRequest'
 import { GroupDecreaseSubType, OB11GroupDecreaseEvent } from './event/notice/OB11GroupDecreaseEvent'
 import { selfInfo } from '../common/globalVars'
-import { Config as LLOBConfig, OB11Config } from '../common/types'
+import { Config as LLOBConfig, JniConfig, OB11Config } from '../common/types'
 import { OB11WebSocket, OB11WebSocketReverse } from './connect/ws'
 import { OB11Http, OB11HttpPost } from './connect/http'
+import { OB11Jni } from './birdge/connect'
 import { OB11BaseEvent } from './event/OB11BaseEvent'
 import { initActionMap } from './action'
 import { OB11GroupAdminNoticeEvent } from './event/notice/OB11GroupAdminNoticeEvent'
@@ -52,6 +53,7 @@ class Onebot11Adapter extends Service {
     'qqProtocol', 'timer', 'config'
   ]
   private connect: (OB11Http | OB11HttpPost | OB11WebSocket | OB11WebSocketReverse)[]
+  private jni?: OB11Jni
   private actionMap: Map<string, BaseAction<unknown, unknown>>
   private reportOfflineMessage: boolean
   private reportSelfMessage: boolean
@@ -89,6 +91,54 @@ class Onebot11Adapter extends Service {
         throw new Error('incorrect ob11 connect type')
       }
     })
+    // Java 插件桥接直接在 OneBot 协议层内工作，不属于 connect 数组
+    if (config.jni) {
+      this.jni = this.createJni(config.jni)
+      // jni 也参与全局"上报自身消息"收集：否则 handleMsg 会在到达 jni 前直接过滤掉自身消息
+      if (config.jni.reportSelfMessage) {
+        this.reportSelfMessage = true
+      }
+    }
+  }
+
+  private createJni(jniConfig: JniConfig): OB11Jni {
+    return new OB11Jni(this.ctx, {
+      ...jniConfig,
+      actionMap: this.actionMap,
+      onEmit: (event) => this.dispatchFromBridge(event),
+    })
+  }
+
+  /** Java 桥接当前状态（供 WebUI 展示） */
+  public get jniStatus() {
+    return {
+      running: this.jni?.running ?? false,
+      plugins: this.jni?.plugins ?? [],
+    }
+  }
+
+  /** 热重载 Java 插件桥接：停止并重启 Java 进程，重新扫描插件目录 */
+  public async reloadJni() {
+    if (!this.jni) {
+      return { running: false, plugins: [] }
+    }
+    return await this.jni.reload()
+  }
+
+  /** 加载单个 Java 插件（热插拔） */
+  public async loadJniPlugin(pluginId: string) {
+    if (!this.jni) {
+      throw new Error('Java 插件桥接未启用')
+    }
+    return await this.jni.loadPlugin(pluginId)
+  }
+
+  /** 卸载单个 Java 插件（热插拔，触发插件 onCleanup） */
+  public async unloadJniPlugin(pluginId: string) {
+    if (!this.jni) {
+      throw new Error('Java 插件桥接未启用')
+    }
+    return await this.jni.unloadPlugin(pluginId)
   }
 
   async [Service.init]() {
@@ -100,17 +150,30 @@ class Onebot11Adapter extends Service {
     for (const item of this.connect) {
       item.emitEvent(event)
     }
+    this.jni?.notifyEvent(event)
+  }
+
+  /** Java 桥接侧推送的事件，回流到各协议连接 */
+  public dispatchFromBridge(event: OB11BaseEvent) {
+    // Java 侧来的是普通 JSON 对象，没有类方法；各连接的 emitEvent 会调用 getSummaryEventName，补上防止抛错
+    const evt = event as OB11BaseEvent & { getSummaryEventName?: () => string }
+    if (evt.post_type && typeof evt.getSummaryEventName !== 'function') {
+      evt.getSummaryEventName = () => `${evt.post_type}.${evt[evt.post_type + '_type']}`
+    }
+    for (const item of this.connect) {
+      item.emitEvent(event)
+    }
   }
 
   public dispatchMessageLike(event: OB11BaseEvent, self: boolean, offline: boolean) {
     if (this.connect.length === 1) {
       this.connect[0].emitMessageLikeEvent(event, self, offline)
-      return
+    } else {
+      for (const item of this.connect) {
+        item.emitMessageLikeEvent(cloneObj(event), self, offline)
+      }
     }
-    for (const item of this.connect) {
-      // 这里不 copy 出来的话，更改了 msg.message 会影响下一个 connect
-      item.emitMessageLikeEvent(cloneObj(event), self, offline)
-    }
+    this.jni?.notifyMessage(cloneObj(event), self)
   }
 
   private async handleMsg(message: RawMessage, self: boolean, offline: boolean) {
@@ -151,6 +214,7 @@ class Onebot11Adapter extends Service {
         await item.stop()
       }
     }
+    await this.jni?.stop()
     if (config.ob11.enable) {
       this.reportOfflineMessage = false
       this.reportSelfMessage = false
@@ -182,10 +246,17 @@ class Onebot11Adapter extends Service {
           throw new Error('incorrect ob11 connect type')
         }
       })
+      this.jni = config.ob11.jni ? this.createJni(config.ob11.jni) : undefined
+      if (config.ob11.jni?.reportSelfMessage) {
+        this.reportSelfMessage = true
+      }
       for (const item of this.connect) {
         if (item.config.enable) {
           item.start()
         }
+      }
+      if (config.ob11.jni?.enable) {
+        this.jni?.start().catch(e => this.ctx.logger.error('[JNI] 启动 Java 桥接器失败:', e))
       }
     }
     Object.assign(this.config, {
@@ -203,6 +274,9 @@ class Onebot11Adapter extends Service {
         if (item.config.enable) {
           item.start()
         }
+      }
+      if (this.config.jni?.enable) {
+        this.jni?.start().catch(e => this.ctx.logger.error('[JNI] 启动 Java 桥接器失败:', e))
       }
     }
     this.ctx.on('llob/config-updated', input => {

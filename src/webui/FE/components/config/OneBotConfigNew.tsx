@@ -1,14 +1,32 @@
-import React, { useState } from 'react';
-import { OB11Config, ConnectConfig, WsConnectConfig, WsReverseConnectConfig, HttpConnectConfig, HttpPostConnectConfig } from '../../types';
-import { Radio, Wifi, Globe, Send, X, Settings, Plus, Trash2, Edit2, Eye, EyeOff, ExternalLink } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { OB11Config, ConnectConfig, WsConnectConfig, WsReverseConnectConfig, HttpConnectConfig, HttpPostConnectConfig, JniConfig } from '../../types';
+import { Radio, Wifi, Globe, Send, X, Settings, Plus, Trash2, Edit2, Eye, EyeOff, ExternalLink, Coffee, RefreshCw, Play, Power, List } from 'lucide-react';
 import { Portal, HostSelector } from '../common';
 import { showToast } from '../common';
 import EventFilterEditor from './EventFilterEditor';
+import { apiFetch } from '../../utils/api';
 
 interface OneBotConfigProps {
   config: OB11Config;
   onChange: (config: OB11Config) => void;
   onSave: (config?: OB11Config) => void;
+}
+
+/** Java 插件信息（与后端 JavaPluginInfo 一致） */
+interface JniPluginItem {
+  id: string;
+  name: string;
+  version: string;
+  description?: string;
+  author?: string;
+  entry: string;
+  enabled: boolean;
+}
+
+interface JniStatus {
+  ready: boolean;
+  running: boolean;
+  plugins: JniPluginItem[];
 }
 
 const OneBotConfigNew: React.FC<OneBotConfigProps> = ({ config, onChange, onSave }) => {
@@ -20,6 +38,22 @@ const OneBotConfigNew: React.FC<OneBotConfigProps> = ({ config, onChange, onSave
   const [editingName, setEditingName] = useState(false);
   const [tempName, setTempName] = useState('');
   const [showToken, setShowToken] = useState(false);
+  const [jniReloading, setJniReloading] = useState(false);
+  const [jniStatus, setJniStatus] = useState<JniStatus | null>(null);
+  const [operatingPluginId, setOperatingPluginId] = useState<string | null>(null);
+  const [showPluginDialog, setShowPluginDialog] = useState(false);
+
+  // 老配置可能没有 jni 段，用默认值兜底
+  const jni: JniConfig = config.jni ?? {
+    enable: false,
+    javaPath: 'java',
+    jvmArgs: ['-Xmx256m'],
+    bridgeJar: 'onebot-bridge.jar',
+    javaPluginDir: 'java-plugins',
+    classpath: [],
+    callTimeout: 30000,
+    reportSelfMessage: false,
+  };
 
   const adapterInfo = {
     'ws': { icon: Radio, name: 'WebSocket正向', desc: '提供WebSocket服务器' },
@@ -139,6 +173,70 @@ const OneBotConfigNew: React.FC<OneBotConfigProps> = ({ config, onChange, onSave
     setSelectedAdapter({ ...selectedAdapter, [field]: value });
   };
 
+  // 拉取桥接运行状态
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const res = await apiFetch<JniStatus>('/api/ob11/jni/status');
+        if (!cancelled && res.success && res.data) {
+          setJniStatus({ ready: res.data.ready, running: res.data.running, plugins: res.data.plugins || [] });
+        }
+      } catch { /* 未就绪时忽略 */ }
+    };
+    load();
+    return () => { cancelled = true; };
+  }, []);
+
+  // 修改 jni 配置并保存（保存后后端自动停止/重启桥接，即热重载）
+  const updateJni = (partial: Partial<JniConfig>) => {
+    const newConfig = { ...config, jni: { ...jni, ...partial } };
+    onChange(newConfig);
+    onSave(newConfig);
+  };
+
+  // 显式热重载：重启 Java 进程、重新扫描插件目录（更新插件 jar 后使用）
+  const handleReloadJni = async () => {
+    setJniReloading(true);
+    try {
+      const res = await apiFetch<JniStatus>('/api/ob11/jni/reload', { method: 'POST' });
+      if (res.success) {
+        showToast(res.message || 'Java 插件重载成功', 'success');
+        setJniStatus({ ready: true, running: res.data?.running ?? false, plugins: res.data?.plugins || [] });
+      } else {
+        showToast(res.message || '重载失败', 'error');
+      }
+    } catch (e) {
+      showToast('重载失败: ' + (e instanceof Error ? e.message : String(e)), 'error');
+    } finally {
+      setJniReloading(false);
+    }
+  };
+
+  // 单个插件热插拔：已启用 → 卸载，未启用 → 加载（无需重启桥接进程）
+  const handleTogglePlugin = async (plugin: JniPluginItem) => {
+    setOperatingPluginId(plugin.id);
+    try {
+      const res = await apiFetch<JniStatus & { ok: boolean }>(`/api/ob11/jni/${plugin.enabled ? 'unload' : 'load'}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pluginId: plugin.id }),
+      });
+      if (res.success) {
+        showToast(res.message || `${plugin.enabled ? '卸载' : '加载'}成功`, 'success');
+        if (res.data) {
+          setJniStatus({ ready: true, running: res.data.running, plugins: res.data.plugins || [] });
+        }
+      } else {
+        showToast(res.message || `${plugin.enabled ? '卸载' : '加载'}失败`, 'error');
+      }
+    } catch (e) {
+      showToast(`${plugin.enabled ? '卸载' : '加载'}失败: ${e instanceof Error ? e.message : String(e)}`, 'error');
+    } finally {
+      setOperatingPluginId(null);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* 总开关 */}
@@ -172,6 +270,178 @@ const OneBotConfigNew: React.FC<OneBotConfigProps> = ({ config, onChange, onSave
           />
         </div>
       </div>
+
+      {/* Java 插件桥接 */}
+      {config.enable && (
+        <div className="card p-6">
+          <div className="flex items-center gap-3 mb-4">
+            <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center">
+              <Coffee size={24} className="text-white" />
+            </div>
+            <div className="flex-1">
+              <h3 className="text-lg font-semibold text-theme">Java 插件桥接</h3>
+              <p className="text-sm text-theme-secondary">与 Java 插件双向通信，插件目录: {jni.javaPluginDir}</p>
+            </div>
+            <input
+              type="checkbox"
+              checked={jni.enable}
+              onChange={(e) => updateJni({ enable: e.target.checked })}
+              className="switch-toggle-lg"
+            />
+          </div>
+
+          {jni.enable && (
+            <div className="space-y-4 border-t border-theme-divider pt-4">
+              <div className="flex items-center justify-between p-4 bg-theme-item rounded-xl">
+                <div>
+                  <div className="text-sm font-medium text-theme">上报自身消息</div>
+                  <div className="text-xs text-theme-muted mt-0.5">开启后，机器人自己发送的消息也会推送给 Java 插件</div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={jni.reportSelfMessage}
+                  onChange={(e) => updateJni({ reportSelfMessage: e.target.checked })}
+                  className="switch-toggle"
+                />
+              </div>
+
+              <div className="flex items-center justify-between p-4 bg-theme-item rounded-xl">
+                <div>
+                  <div className="text-sm font-medium text-theme">桥接状态</div>
+                  <div className="text-xs text-theme-muted mt-0.5">
+                    {jniStatus?.ready === false
+                      ? '未登录时不可用'
+                      : jniStatus?.running
+                        ? `运行中 · 共 ${jniStatus.plugins.length} 个插件`
+                        : '未运行'}
+                  </div>
+                  {/* 插件简要列表：启用为绿色，未启用为灰色 */}
+                  {jniStatus?.running && jniStatus.plugins.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 mt-2">
+                      {jniStatus.plugins.map((p) => (
+                        <span
+                          key={p.id || p.name}
+                          title={`${p.name}${p.description ? ` - ${p.description}` : ''}`}
+                          className={`text-xs px-2 py-0.5 rounded-full ${p.enabled
+                            ? 'bg-green-100 dark:bg-green-900/50 text-green-800 dark:text-green-400'
+                            : 'bg-gray-100 dark:bg-neutral-700 text-gray-600 dark:text-neutral-400'}`}
+                        >
+                          {p.name}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setShowPluginDialog(true)}
+                    disabled={!jniStatus?.running}
+                    className="px-4 py-2.5 text-sm font-medium text-theme-secondary bg-theme-item hover:bg-theme-item-hover rounded-xl transition-colors flex items-center gap-2 disabled:opacity-50"
+                  >
+                    <List size={16} />
+                    插件详情
+                  </button>
+                  <button
+                    onClick={handleReloadJni}
+                    disabled={jniReloading}
+                    className="btn-primary flex items-center gap-2"
+                  >
+                    <RefreshCw size={16} className={jniReloading ? 'animate-spin' : ''} />
+                    {jniReloading ? '重载中...' : '重载插件'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Java 插件详情弹窗：单个插件热插拔 */}
+      {showPluginDialog && (
+        <Portal>
+          <div className="fixed inset-0 bg-black/30 dark:bg-black/50 backdrop-blur-sm flex items-center justify-center p-4" style={{ zIndex: 9000 }}>
+            <div className="bg-white/60 dark:bg-neutral-800/90 backdrop-blur-xl rounded-3xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col border border-white/50 dark:border-neutral-700/50">
+              {/* Header */}
+              <div className="flex items-center justify-between p-6 border-b border-white/20 dark:border-neutral-700/50">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center">
+                    <Coffee size={20} className="text-white" />
+                  </div>
+                  <div>
+                    <h3 className="text-xl font-semibold text-theme">Java 插件详情</h3>
+                    <p className="text-sm text-theme-secondary">
+                      {jniStatus?.running ? `共 ${jniStatus.plugins.length} 个插件 · 点击加载/卸载启用或禁用` : '桥接未运行'}
+                    </p>
+                  </div>
+                </div>
+                <button onClick={() => setShowPluginDialog(false)} className="text-theme-hint hover:text-theme">
+                  <X size={24} />
+                </button>
+              </div>
+
+              {/* Body */}
+              <div className="p-6 space-y-3 overflow-y-auto flex-1">
+                {!jniStatus?.running ? (
+                  <div className="text-sm text-theme-muted text-center py-10">Java 桥接未运行，无法管理插件</div>
+                ) : jniStatus.plugins.length === 0 ? (
+                  <div className="text-sm text-theme-muted text-center py-10">未发现插件，将 jar 放入插件目录后点击“重载插件”扫描</div>
+                ) : (
+                  jniStatus.plugins.map((p) => (
+                    <div key={p.id || p.name} className="flex items-center justify-between gap-3 p-4 rounded-2xl bg-theme-item border border-theme-divider">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-sm font-semibold text-theme">{p.name}</span>
+                          {p.version && <span className="text-xs px-1.5 py-0.5 rounded bg-theme-hint/10 text-theme-hint">{p.version}</span>}
+                          <span className={`text-xs px-2 py-0.5 rounded-full ${p.enabled
+                            ? 'bg-green-100 dark:bg-green-900/50 text-green-800 dark:text-green-400'
+                            : 'bg-gray-100 dark:bg-neutral-700 text-gray-600 dark:text-neutral-400'}`}>
+                            {p.enabled ? '已启用' : '未启用'}
+                          </span>
+                        </div>
+                        <div className="text-xs text-theme-muted mt-1 truncate" title={p.id}>
+                          ID: {p.id}{p.author ? ` · ${p.author}` : ''}
+                        </div>
+                        {p.description && <div className="text-xs text-theme-secondary mt-1">{p.description}</div>}
+                      </div>
+                      <button
+                        onClick={() => handleTogglePlugin(p)}
+                        disabled={operatingPluginId === p.id}
+                        className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg font-medium transition-colors flex-shrink-0 disabled:opacity-50 ${
+                          p.enabled
+                            ? 'bg-red-500/10 text-red-500 hover:bg-red-500/20'
+                            : 'bg-green-500/10 text-green-600 hover:bg-green-500/20 dark:text-green-400'
+                        }`}
+                      >
+                        {operatingPluginId === p.id ? (
+                          <>
+                            <RefreshCw size={14} className="animate-spin" />
+                            {p.enabled ? '禁用中...' : '启用中...'}
+                          </>
+                        ) : p.enabled ? (
+                          <>
+                            <Power size={14} />
+                            禁用
+                          </>
+                        ) : (
+                          <>
+                            <Play size={14} />
+                            启用
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              {/* Footer */}
+              <div className="flex justify-end p-6 border-t border-white/20 dark:border-neutral-700/50">
+                <button onClick={() => setShowPluginDialog(false)} className="px-6 py-2.5 text-theme-secondary hover:bg-theme-item rounded-xl font-medium transition-colors">关闭</button>
+              </div>
+            </div>
+          </div>
+        </Portal>
+      )}
 
       {/* 适配器卡片 */}
       {config.enable && config.connect && Array.isArray(config.connect) && (

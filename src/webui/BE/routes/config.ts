@@ -107,5 +107,97 @@ export function createConfigRoutes(ctx: Context): Hono {
     }
   })
 
+  // Java 插件桥接：当前状态（登录后 onebot 服务才就绪）
+  router.get('/ob11/jni/status', async (c) => {
+    try {
+      let onebot: Context['onebot'] | undefined
+      try {
+        onebot = ctx.get('onebot' as never) as Context['onebot'] | undefined
+      } catch {
+        onebot = undefined
+      }
+      if (!onebot) {
+        return c.json({ success: true, data: { ready: false, running: false, plugins: [] } })
+      }
+      const status = onebot.jniStatus
+      return c.json({ success: true, data: { ready: true, ...status } })
+    } catch (e) {
+      return c.json({ success: false, message: '获取 Java 插件桥接状态失败', error: e }, 500)
+    }
+  })
+
+  // Java 插件桥接：热重载（停止并重启 Java 进程，重新扫描插件目录）
+  router.post('/ob11/jni/reload', async (c) => {
+    try {
+      let onebot: Context['onebot'] | undefined
+      try {
+        onebot = ctx.get('onebot' as never) as Context['onebot'] | undefined
+      } catch {
+        onebot = undefined
+      }
+      if (!onebot) {
+        return c.json({ success: false, message: 'OneBot 适配器未就绪（请确认已登录且 OneBot 11 已启用）' }, 400)
+      }
+      const status = await onebot.reloadJni()
+      return c.json({
+        success: true,
+        message: status.running
+          ? `Java 插件重载成功，已加载 ${status.plugins.length} 个插件`
+          : 'Java 插件桥接已停止（当前未启用）',
+        data: status,
+      })
+    } catch (e) {
+      return c.json({ success: false, message: '重载 Java 插件失败', error: e }, 500)
+    }
+  })
+
+  // Java 插件桥接：加载单个插件（热插拔，无需重启进程）
+  router.post('/ob11/jni/load', async (c) => {
+    try {
+      const { pluginId } = await c.req.json() as { pluginId?: string }
+      if (!pluginId) {
+        return c.json({ success: false, message: '缺少 pluginId' }, 400)
+      }
+      let onebot: Context['onebot'] | undefined
+      try {
+        onebot = ctx.get('onebot' as never) as Context['onebot'] | undefined
+      } catch {
+        onebot = undefined
+      }
+      if (!onebot) {
+        return c.json({ success: false, message: 'OneBot 适配器未就绪（请确认已登录且 OneBot 11 已启用）' }, 400)
+      }
+      const result = await onebot.loadJniPlugin(pluginId)
+      // 附带最新插件列表，前端可直接刷新 UI 无需二次请求
+      return c.json({ success: true, message: `插件 ${pluginId} 加载成功`, data: { ...result, ...onebot.jniStatus } })
+    } catch (e) {
+      return c.json({ success: false, message: `加载插件失败: ${(e as Error).message}`, error: e }, 500)
+    }
+  })
+
+  // Java 插件桥接：卸载单个插件（热插拔，触发插件 onCleanup）
+  router.post('/ob11/jni/unload', async (c) => {
+    try {
+      const { pluginId } = await c.req.json() as { pluginId?: string }
+      if (!pluginId) {
+        return c.json({ success: false, message: '缺少 pluginId' }, 400)
+      }
+      let onebot: Context['onebot'] | undefined
+      try {
+        onebot = ctx.get('onebot' as never) as Context['onebot'] | undefined
+      } catch {
+        onebot = undefined
+      }
+      if (!onebot) {
+        return c.json({ success: false, message: 'OneBot 适配器未就绪（请确认已登录且 OneBot 11 已启用）' }, 400)
+      }
+      const result = await onebot.unloadJniPlugin(pluginId)
+      // 附带最新插件列表，前端可直接刷新 UI 无需二次请求
+      return c.json({ success: true, message: `插件 ${pluginId} 卸载成功`, data: { ...result, ...onebot.jniStatus } })
+    } catch (e) {
+      return c.json({ success: false, message: `卸载插件失败: ${(e as Error).message}`, error: e }, 500)
+    }
+  })
+
   return router
 }
