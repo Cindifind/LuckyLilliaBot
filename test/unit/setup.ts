@@ -40,7 +40,13 @@ vi.mock('@/main/log', () => ({
   getLogCache: vi.fn(() => []),
 }))
 
+// getProtocol/getCdn/isDevMode 少了会让 direct-lib 在 import 期就炸 (appInfo -> getActiveProfile 直接读; sign-proxy / config 顶层读 isDevMode)
 vi.mock('@/common/utils/environment', () => ({
   isDockerEnvironment: vi.fn(() => false),
   isPmhqMode: vi.fn(() => false),
+  isDevMode: vi.fn(() => false),
+  getProtocol: vi.fn(() => 'linux'),
+  getCdn: vi.fn(() => 'cf'),
+  getAuthTokenPageUrl: vi.fn(() => 'https://auth.luckylillia.com'),
+  getSpecifiedUin: vi.fn(() => undefined),
 }))
