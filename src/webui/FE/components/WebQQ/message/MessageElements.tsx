@@ -3,9 +3,10 @@ import { Loader2, Mic, Play, Pause, ChevronRight, X, FileText } from 'lucide-rea
 import { createPortal } from 'react-dom'
 import type { MessageElement, RawMessage } from '../../../types/webqq'
 import { getToken } from '../../../utils/api'
-import { translatePttToText, getAudioProxyUrl, getForwardMessages } from '../../../utils/webqqApi'
+import { translatePttToText, getAudioProxyUrl, getForwardMessages, getPrivateFileUrl, getSelfUid } from '../../../utils/webqqApi'
 import type { ForwardMessageItem, ForwardMessageSegment } from '../../../utils/webqqApi'
 import { useImageRkeyStore } from '../../../stores/imageRkeyStore'
+import { showToast } from '../common'
 
 // 图片预览上下文
 export const ImagePreviewContext = React.createContext<{
@@ -142,9 +143,13 @@ export const MessageElementRenderer = memo<{ element: MessageElement; message?: 
   }
   if (element.fileElement) {
     const f = element.fileElement
-    // 仅群聊文件卡片可点击定位 (私聊无群文件面板)
-    const groupFile = message?.chatType === 2 ? { fileId: f.fileUuid, folderId: f.folderId } : undefined
-    return <FileElementCard fileName={f.fileName} fileSize={f.fileSize} groupFile={groupFile} />
+    const isGroup = message?.chatType === 2
+    // 群文件卡片可点击定位到群文件面板; 私聊文件卡片可点击直接下载 (私聊无群文件面板)
+    const groupFile = isGroup ? { fileId: f.fileUuid, folderId: f.folderId } : undefined
+    const privateFile = message && !isGroup && f.fileUuid
+      ? { fileId: f.fileUuid, peerUid: message.peerUid, isSelfSend: message.senderUid === getSelfUid() }
+      : undefined
+    return <FileElementCard fileName={f.fileName} fileSize={f.fileSize} groupFile={groupFile} privateFile={privateFile} />
   }
   if (element.pttElement) {
     return <PttElementRenderer element={element} message={message} />
@@ -196,7 +201,7 @@ export const MessageElementRenderer = memo<{ element: MessageElement; message?: 
         style={{ width: displayWidth, height: displayHeight }}
         onClick={handleClick}
       >
-        <div className="absolute inset-0 bg-gray-200 dark:bg-gray-700" />
+        <div className="absolute inset-0 fill-quiet" />
 
         {thumbUrl ? (
           <>
@@ -286,22 +291,49 @@ export const MessageElementRenderer = memo<{ element: MessageElement; message?: 
 
 // 文件卡片. 跟图片/视频一样作为独立元素渲染, 不含状态文字 ("已发送"等),
 // 状态由外层 MessageBubble 决定要不要展示.
-const FileElementCard = memo<{ fileName: string; fileSize: number; groupFile?: { fileId: string; folderId: string } }>(({ fileName, fileSize, groupFile }) => {
+const FileElementCard = memo<{
+  fileName: string
+  fileSize: number
+  groupFile?: { fileId: string; folderId: string }
+  privateFile?: { fileId: string; peerUid: string; isSelfSend: boolean }
+}>(({ fileName, fileSize, groupFile, privateFile }) => {
   const sizeText = formatFileSize(fileSize)
   const fileCardContext = React.useContext(FileCardContext)
-  const clickable = !!groupFile && !!fileCardContext
+  const [downloading, setDownloading] = useState(false)
+  const groupClickable = !!groupFile && !!fileCardContext
+  const privateClickable = !!privateFile
+  const clickable = groupClickable || privateClickable
+
+  const handleClick = async () => {
+    if (groupClickable) {
+      fileCardContext!.open(groupFile!)
+      return
+    }
+    if (privateClickable && !downloading) {
+      setDownloading(true)
+      try {
+        const url = await getPrivateFileUrl(privateFile!.peerUid, privateFile!.fileId, privateFile!.isSelfSend)
+        window.open(url, '_blank')
+      } catch (e) {
+        showToast((e as Error).message || '下载失败', 'error')
+      } finally {
+        setDownloading(false)
+      }
+    }
+  }
+
   return (
     <div
       className={`flex items-center gap-3 px-3 py-2.5 rounded-lg bg-white/5 dark:bg-white/5 border border-white/10 min-w-[220px] max-w-[280px]${clickable ? ' cursor-pointer hover:bg-white/10 transition-colors' : ''}`}
-      onClick={clickable ? () => fileCardContext!.open(groupFile!) : undefined}
-      title={clickable ? '在群文件中查看' : undefined}
+      onClick={clickable ? handleClick : undefined}
+      title={groupClickable ? '在群文件中查看' : privateClickable ? '点击下载' : undefined}
     >
       <div className="flex-1 min-w-0">
         <div className="text-sm font-medium leading-snug line-clamp-2 break-all">{fileName}</div>
         {sizeText && <div className="text-xs opacity-60 mt-1">{sizeText}</div>}
       </div>
       <div className="flex-shrink-0 w-10 h-10 rounded bg-white/10 flex items-center justify-center">
-        <FileText className="w-5 h-5 opacity-70" />
+        {downloading ? <Loader2 className="w-5 h-5 opacity-70 animate-spin" /> : <FileText className="w-5 h-5 opacity-70" />}
       </div>
     </div>
   )
@@ -473,7 +505,7 @@ const PttElementRenderer: React.FC<{ element: MessageElement; message?: RawMessa
           <button
             onClick={handleTranscribe}
             disabled={isTranscribing}
-            className="w-6 h-6 flex items-center justify-center rounded-full bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-500 dark:text-gray-300 hover:text-gray-700 dark:hover:text-white text-xs font-medium transition-colors disabled:opacity-50"
+            className="w-6 h-6 flex items-center justify-center rounded-full fill-quiet fill-quiet-hover text-gray-500 dark:text-gray-300 hover:text-gray-700 dark:hover:text-white text-xs font-medium transition-colors disabled:opacity-50"
             title="语音转文字"
           >
             {isTranscribing ? <Loader2 size={12} className="animate-spin" /> : '文'}
@@ -483,7 +515,7 @@ const PttElementRenderer: React.FC<{ element: MessageElement; message?: RawMessa
 
       {/* 转换后的文字 */}
       {(existingText || transcribedText) && (
-        <div className={`text-sm px-3 py-1.5 bg-gray-100 dark:bg-gray-800 rounded-lg max-w-[250px] ${transcribeError ? 'text-red-500' : 'text-theme-secondary'}`}>
+        <div className={`text-sm px-3 py-1.5 fill-quiet r-control max-w-[250px] ${transcribeError ? 'text-red-500' : 'text-theme-secondary'}`}>
           {existingText || transcribedText}
         </div>
       )}
@@ -547,7 +579,7 @@ const NestedForwardCard: React.FC<{ resId: string; title: string }> = ({ resId, 
   return (
     <>
       <div
-        className="flex items-center gap-2 px-3 py-2 bg-gray-100 dark:bg-gray-800 rounded-lg cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
+        className="flex items-center gap-2 px-3 py-2 fill-quiet r-control cursor-pointer fill-quiet-hover transition-colors"
         onClick={() => setShowModal(true)}
       >
         <span className="text-sm text-theme-secondary">{title}</span>
@@ -576,7 +608,7 @@ const ForwardMsgElementRenderer: React.FC<{ element: MessageElement }> = ({ elem
   return (
     <>
       <div
-        className="w-[240px] bg-gray-50 dark:bg-gray-800/80 rounded-lg overflow-hidden cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700/80 transition-colors border border-theme-divider"
+        className="w-[240px] fill-quiet r-control overflow-hidden cursor-pointer fill-quiet-hover transition-colors border border-theme-divider"
         onClick={() => setShowModal(true)}
       >
         <div className="px-3 pt-2.5 pb-1">
@@ -607,7 +639,7 @@ const ArkForwardMsgRenderer: React.FC<{ arkData: any }> = ({ arkData }) => {
   return (
     <>
       <div
-        className="w-[240px] bg-gray-50 dark:bg-gray-800/80 rounded-lg overflow-hidden cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700/80 transition-colors border border-theme-divider"
+        className="w-[240px] fill-quiet r-control overflow-hidden cursor-pointer fill-quiet-hover transition-colors border border-theme-divider"
         onClick={() => setShowModal(true)}
       >
         <div className="px-3 pt-2.5 pb-1">
@@ -657,15 +689,15 @@ const ForwardMsgModal: React.FC<{ resId: string; title: string; onClose: () => v
   }
 
   return createPortal(
-    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={onClose}>
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center scrim" onClick={onClose}>
       <div
-        className="bg-white dark:bg-neutral-900 rounded-2xl shadow-2xl w-[90vw] max-w-[480px] max-h-[80vh] flex flex-col overflow-hidden"
+        className="glass glass-thick r-window glass-pop w-[90vw] max-w-[480px] max-h-[80vh] flex flex-col overflow-hidden"
         onClick={e => e.stopPropagation()}
       >
         {/* 标题栏 */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-theme-divider flex-shrink-0">
           <span className="font-medium text-theme">{title}</span>
-          <button onClick={onClose} className="p-1 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
+          <button onClick={onClose} className="p-1 rounded-full fill-quiet-hover transition-colors">
             <X size={18} className="text-theme-hint" />
           </button>
         </div>

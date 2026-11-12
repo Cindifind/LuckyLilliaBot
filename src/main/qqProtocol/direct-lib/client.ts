@@ -3,14 +3,33 @@ import { TcpConnection } from './connection'
 import { buildServicePacket, buildServicePacket13, parseServicePacket, EncryptType, PacketContext, SsoPacket } from './packet'
 import { generateEcdhKeyPair, EcdhKeyPair } from './ecdh'
 import { generateWatchEcdhKeyPair } from './watch/ecdh'
-import { requestSign, setupSign, setSignMachineGuid, acquireSignToken, acquireMacosEskOnly, SignResult, type MacosEskState } from './sign'
+import { requestSign, setupSign, setSignMachineGuid, acquireSignToken, acquireMacosEskOnly, startLinuxSsoReport, stopLinuxSsoReport, buildLinuxXwidBody, signLinuxXwidBurst, SignResult, type MacosEskState } from './sign'
 import { AppInfo } from './appInfo'
 import { getActiveProfile } from './profiles'
 import { loadMachineGuidSync } from './machineGuid'
 import { EventEmitter } from 'node:events'
 import { CmdNotPermittedError, CMD_NOT_PERMITTED_RET_CODE } from '@/common/protocolErrors'
+import { isCmdAllowed, CmdBlockedError, logCmdWhitelistStatus } from './cmdWhitelist'
+import { cmdNeedsSign } from './cmd'
+import { recordKey } from './packetDump'
+import {
+  buildGetNewFlag, buildClientReport, buildPsKey, TELEMETRY_CMDS,
+  buildPsKey102a1, build116d1, build9067202, buildSsoGetConfig, AUX_TELEMETRY_CMDS,
+} from './telemetry'
+import { parseConfigPushReq, buildConfigPushResp, CONFIG_PUSH_REQ, CONFIG_PUSH_RESP } from './configPush'
 
 const logger = getLogger('direct')
+
+// Linux 登录 xwid 突发条数。真机登录瞬间连号发 ~2500 条 (实测 ~1ms/包、~1000/s、摊 ~2.5s;
+// 非"微秒瞬时", sign 在进程内 sub-ms)。我们批量签 (一次 NAPI, sign-core ~450k/s) + 分块 pace 复刻。
+// 默认 2000 对齐真机 (~2523)。大量突发理论上有踩服务端限流的风险, 要调小/关掉设 env LINUX_XWID_BURST
+// (如 1); pace 默认 1000/s (LINUX_XWID_BURST_RATE) 已摊到 ~2s, 跟真机节奏一致, 非瞬发尖峰。
+// 2026-10-06 真机 691 登录抓包实证: 登录瞬间 SsoReport xwid 爆发 = ~948 条 (背靠背)。
+// 2026-10-05 曾怀疑"突发触发风控"把默认砍到 1 -> Bot 登录只发 4 条 SsoReport, 跟真机 ~948 差了两个数量级;
+// 实测证明爆发是真机正常行为, 缺了它才是"非真客户端"信号。还原默认到真机量级。env 仍可覆盖。
+const LINUX_XWID_BURST = Math.max(0, Number(process.env.LINUX_XWID_BURST || '2000') | 0)
+// 发送速率 (包/秒), 默认 1000 对齐真机; 设很大 (如 999999) = 瞬发不 pace。分块 pace 避免尖峰触发限流。
+const LINUX_XWID_BURST_RATE = Math.max(1, Number(process.env.LINUX_XWID_BURST_RATE || '1000') | 0)
 
 export interface DirectClientConfig {
   appId: number
@@ -73,6 +92,8 @@ export class DirectProtocolClient extends EventEmitter {
   // Bumped on every close, so an ESK still in flight when its connection dies gets discarded.
   private connEpoch = 0
   private heartbeatAliveTimer: NodeJS.Timeout | null = null
+  private telemetryTimer: NodeJS.Timeout | null = null
+  private auxTelemetryTimer: NodeJS.Timeout | null = null
   // 计时诊断: 按 seq 记响应帧「进 handlePacket」的时刻, 拆 wire vs parse.
   private frameArriveAt: Map<number, number> = new Map()
   // event loop lag 采样: setInterval 期望 50ms 一跳, 实测跳间隔 - 50 = 主线程被阻塞的量.
@@ -92,6 +113,10 @@ export class DirectProtocolClient extends EventEmitter {
     this.conn = new TcpConnection()
     // watch wtlogin 用 P-256, 桌面用 secp192k1
     this.ecdhKeyPair = getActiveProfile().family === 'watch' ? generateWatchEcdhKeyPair() : generateEcdhKeyPair()
+    recordKey('ecdh.privateKey', this.ecdhKeyPair.privateKey, 'wtlogin ECDH, per client instance')
+    recordKey('ecdh.publicKey', this.ecdhKeyPair.publicKey, 'sent in the wtlogin frame head')
+    recordKey('ecdh.shareKey', this.ecdhKeyPair.shareKey, 'TEA key of every wtlogin body')
+    recordKey('device.guid', this.guid, 'machine guid')
 
     this.conn.on('packet', (frame: Buffer) => this.handlePacket(frame))
     this.conn.on('error', (err) => this.emit('error', err))
@@ -99,6 +124,7 @@ export class DirectProtocolClient extends EventEmitter {
       // 连接断开必须停 timer: client 是进程单例不重建, 不停的话断线期间会一直往死连接发包,
       // 且重连 connect() 的幂等 guard 会误判"已在跑"而不重启. 停掉才能让重连干净重启.
       this.stopHeartbeatAlive()
+      this.stopTelemetry()
       this.connEpoch++
       this.macosEskState = null
       this.emit('close')
@@ -119,15 +145,31 @@ export class DirectProtocolClient extends EventEmitter {
       machineGuid: this.guid,
       uin: this.config.uin,
       cdn: this.config.cdn,
-      sendPacket: async ({ cmd, body }) => {
-        const resp = (await this.sendCommand(cmd, Buffer.from(body))).payload
-        logger.debug(`[relay] ${cmd}: req=${body.length}B resp=${resp.length}B hex=%h`, resp)
+      sendPacket: async ({ cmd, body, signToken }) => {
+        const req = Buffer.from(body)
+        // [SA 1001 调查 / 最小验证 A] o3 ecdh_access 命令 (ESK/SA) 真机走 enc0x02 零钥握手通道
+        // (scan.pcap 实测 ESK/SA 都是 enc0x02 + A2 + sign)。登录后 sendCommand 默认 enc0x01
+        // d2key, 会让 SA 返业务码 1001。这里强制 ESK/SA 走 EncryptEmpty, 验证"通道假设"。
+        // SsoReport 等其它 o3 命令 (trpc.o3.report.*) 不受影响, 照常 enc0x01。
+        // 详见 LuckyLillia.Sign/docs/Linux/sign-token-protocol-final.md "SA 1001"。
+        //
+        // ★例外: 登录后的 A2 分支 (SsoSecureA2Establish / SsoSecureA2Access / O3GetTail) 要登录
+        // 凭证认证, 必须 enc0x01 + d2。走零钥通道服务端回 -10005 "身份验证失败, 请你重新登录"
+        // 且跟会话是否有效无关 (PoC main.rs:479 实测; SignProxy lib.rs:1086 也注明 enc=1+d2
+        // 由发包层包装)。enc=undefined 让 sendCommand 按 session 自选: 有会话 enc0x01, 无则 enc0x02。
+        const enc = cmd.includes('.o3.ecdh_access.') && !cmd.includes('SsoSecureA2')
+          ? EncryptType.EncryptEmpty
+          : undefined
+        // [SA 1001 修复] signToken 覆盖本命令的 SecInfo sf2 / 签名 token: SA 带 token1, 其它为空。
+        const resp = (await this.sendCommand(cmd, req, enc, undefined, undefined, signToken || undefined)).payload
+        logger.debug(`[relay] ${cmd} enc=${enc === undefined ? 'auto' : enc} signTok=${signToken ? signToken.length + 'B' : '-'}: req=${req.length}B resp=${resp.length}B reqHex=%h respHex=%h`, req, resp)
         return resp
       },
     })
   }
 
   async connect(): Promise<void> {
+    logCmdWhitelistStatus()
     // sign 链路 init (signRequest 依赖); token 有效性不在此 preflight —— 已移到 WebUI 侧
     // 的 HTTP 校验 (validateAuthToken). 旧 preflightSign 在 token 无效(401/403)时会触发
     // native SDK 内部 process.exit, 会把整个 bot 进程带崩, 故移除.
@@ -189,18 +231,124 @@ export class DirectProtocolClient extends EventEmitter {
   /** 周期性发 Heartbeat.Alive 保活连接层. connect() 启动, disconnect()/close 清理. 幂等. */
   private startHeartbeatAlive(): void {
     if (this.heartbeatAliveTimer) return
-    const INTERVAL = 15 * 1000
-    this.heartbeatAliveTimer = setInterval(() => {
+    // 真机 3.2.28 Heartbeat.Alive ~13.5s 一跳且带自然抖动。写死的 10.000s setInterval 本身是机器特征,
+    // 故自调度 setTimeout 带每跳抖动 (~12-15s), 对齐真机节奏。
+    const tick = () => {
       this.sendHeartbeat().catch((e) => {
         logger.error('[Heartbeat.Alive] Failed:', (e as Error).message)
       })
-    }, INTERVAL)
+      this.heartbeatAliveTimer = setTimeout(tick, 12_000 + Math.floor(Math.random() * 3_000))
+    }
+    this.heartbeatAliveTimer = setTimeout(tick, 12_000 + Math.floor(Math.random() * 3_000))
   }
 
   private stopHeartbeatAlive(): void {
     if (this.heartbeatAliveTimer) {
-      clearInterval(this.heartbeatAliveTimer)
+      clearTimeout(this.heartbeatAliveTimer)
       this.heartbeatAliveTimer = null
+    }
+  }
+
+  /**
+   * 稳态遥测 loop. 真机 3.2.28 登录后每 ~316s 必发 getNewFlag + ClientReport + 0x102a_0(psKey);
+   * Bot 原来登录后只有心跳 = "哑连接", 是风控判会话失效 (KickNT 1001 登录已失效) 的最强信号。
+   * 对齐真机周期性发这组遥测。fire-and-forget: 单条失败只 debug, 不影响主链路。linux only。
+   * 由 startLinuxSsoReportLoop() 上线后启动, close/disconnect 停。
+   */
+  private startTelemetryLoop(): void {
+    if (this.telemetryTimer || getActiveProfile().name !== 'linux') return
+    const tick = () => {
+      void this.sendTelemetryRound()
+      // 真机 ~316-317s; 带抖动避免机械规律。
+      this.telemetryTimer = setTimeout(tick, 310_000 + Math.floor(Math.random() * 15_000))
+    }
+    this.telemetryTimer = setTimeout(tick, 310_000 + Math.floor(Math.random() * 15_000))
+  }
+
+  private stopTelemetry(): void {
+    if (this.telemetryTimer) {
+      clearTimeout(this.telemetryTimer)
+      this.telemetryTimer = null
+    }
+    if (this.auxTelemetryTimer) {
+      clearTimeout(this.auxTelemetryTimer)
+      this.auxTelemetryTimer = null
+    }
+  }
+
+  /**
+   * 低频 aux 遥测 loop. 真机 691 ~26-30min 偶发一组 0x102a_1 / 0x116d_1 / 0x9067_202 / SsoGetConfig
+   * (非每轮主遥测), Bot 原来一条不发。补齐这块"真机客户端"完整度。首发延后避开登录爆发, 之后 ~27min
+   * 带抖动。fire-and-forget, linux only。随主 telemetry 一起由 stopTelemetry() 停。
+   */
+  private startAuxTelemetryLoop(): void {
+    if (this.auxTelemetryTimer || getActiveProfile().name !== 'linux') return
+    const tick = () => {
+      void this.sendAuxTelemetryRound()
+      this.auxTelemetryTimer = setTimeout(tick, 1_500_000 + Math.floor(Math.random() * 360_000))
+    }
+    this.auxTelemetryTimer = setTimeout(tick, 300_000 + Math.floor(Math.random() * 120_000))
+  }
+
+  /** 发一组 aux 遥测。0x102a_1 在 sign 白名单会自动签 (对齐真机 f24), 其余不签。各条独立 try。 */
+  private async sendAuxTelemetryRound(): Promise<void> {
+    if (!this.session || !this.isConnected) return
+    const uid = this.session.uid
+    const guidHex = this.guid.toString('hex')
+    const jobs: Array<[string, Buffer]> = [
+      [AUX_TELEMETRY_CMDS.psKey102a1, buildPsKey102a1()],
+      [AUX_TELEMETRY_CMDS.oidb116d1, build116d1(uid)],
+      [AUX_TELEMETRY_CMDS.oidb9067202, build9067202()],
+      [AUX_TELEMETRY_CMDS.ssoGetConfig, buildSsoGetConfig(guidHex)],
+    ]
+    for (const [cmd, body] of jobs) {
+      if (!this.session || !this.isConnected) break
+      try {
+        await this.sendCommand(cmd, body)
+      } catch (e) {
+        logger.debug(`[aux-telemetry] ${cmd} failed: ${(e as Error).message}`)
+      }
+    }
+  }
+
+  /** 发一轮稳态遥测 (getNewFlag + ClientReport + psKey)。各条独立 try, 单条失败不影响其余。 */
+  private async sendTelemetryRound(): Promise<void> {
+    if (!this.session || !this.isConnected) return
+    const uin = this.session.uin ? Number(this.session.uin) : (this.config.uin || 0)
+    if (!uin) return
+    const jobs: Array<[string, Buffer]> = [
+      [TELEMETRY_CMDS.getNewFlag, buildGetNewFlag(uin)],
+      [TELEMETRY_CMDS.clientReport, buildClientReport(uin)],
+      [TELEMETRY_CMDS.psKey, buildPsKey()],
+    ]
+    for (const [cmd, body] of jobs) {
+      if (this.session?.uin !== String(uin) || !this.isConnected) break
+      try {
+        await this.sendCommand(cmd, body)
+      } catch (e) {
+        logger.debug(`[telemetry] ${cmd} failed: ${(e as Error).message}`)
+      }
+    }
+  }
+
+  /**
+   * 真机 3.2.28: 新建 SSO 连接时服务器推 ConfigPushSvc.PushReq(type=1 服务器列表), 客户端必回
+   * ConfigPushSvc.PushResp 回显 {type,seq}(抓真机出站包, body/reserve 逐字节复刻, 2026-10-06)。
+   * Bot 原来静默丢弃 = 行为指纹偏差。fire-and-forget: PushResp 是应答, server 不再回, 不登记
+   * pending(免 15s 超时噪声)。linux only(reserve 仅 linux 验证), 其它端维持旧静默不回归。
+   */
+  private respondConfigPush(payload: Buffer): void {
+    if (getActiveProfile().name !== 'linux' || !this.session || !this.isConnected) return
+    try {
+      const req = parseConfigPushReq(payload)
+      if (!req) return
+      const seq = this.nextSeq()
+      const ctx = this.getPacketContext()
+      const body = buildConfigPushResp(req.type, req.seq)
+      this.conn.send(buildServicePacket(seq, CONFIG_PUSH_RESP, ctx, body, EncryptType.EncryptD2Key, null))
+      logger.debug(`[ConfigPush] PushResp sent (type=${req.type} seq=${req.seq})`)
+    } catch (e) {
+      logger.debug(`[ConfigPush] respond failed: ${(e as Error).message}`)
     }
   }
 
@@ -228,6 +376,7 @@ export class DirectProtocolClient extends EventEmitter {
 
 
   async sendHeartbeat(): Promise<void> {
+    if (!isCmdAllowed('Heartbeat.Alive')) return
     const seq = this.nextSeq()
     const ctx = this.getPacketContext()
     const payload = Buffer.alloc(4)
@@ -252,6 +401,7 @@ export class DirectProtocolClient extends EventEmitter {
 
   disconnect(): void {
     this.stopHeartbeatAlive()
+    this.stopTelemetry()
     this.conn.disconnect()
     for (const [, pending] of this.pendingPackets) {
       clearTimeout(pending.timeout)
@@ -278,543 +428,9 @@ export class DirectProtocolClient extends EventEmitter {
     }
   }
 
-  private readonly SIGN_ALLOWLIST = new Set([
-    'AvatarInfoSvr.QQHeadUrlReq',
-    'CertifiedAccountSvc.certified_account_read.GetFollowList',
-    'ConfigPushSvc.PushResp',
-    'ConnAuthSvr.fast_qq_login',
-    'ConnAuthSvr.get_app_info',
-    'ConnAuthSvr.get_app_info_emp',
-    'ConnAuthSvr.get_auth_api_list',
-    'ConnAuthSvr.get_auth_api_list_emp',
-    'ConnAuthSvr.sdk_auth_api',
-    'ConnAuthSvr.sdk_auth_api_emp',
-    'FeedCloudSvr.trpc.circlesearch.exhibition.ExhibitionSvr.ExhibitionSuggestion',
-    'FeedCloudSvr.trpc.feedcloud.commreader.ComReader.GetBusiInfo',
-    'FeedCloudSvr.trpc.feedcloud.commreader.ComReader.GetCommentList',
-    'FeedCloudSvr.trpc.feedcloud.commreader.ComReader.GetFeedList',
-    'FeedCloudSvr.trpc.feedcloud.commreader.ComReader.GetMainPageBasicData',
-    'FeedCloudSvr.trpc.feedcloud.commreader.ComReader.GetMainPageCommData',
-    'FeedCloudSvr.trpc.feedcloud.commreader.ComReader.GetRelationGroupList',
-    'FeedCloudSvr.trpc.feedcloud.commreader.ComReader.GetReplyList',
-    'FeedCloudSvr.trpc.feedcloud.commreader.ComReader.GetRerankedFeedList',
-    'FeedCloudSvr.trpc.feedcloud.commwriter.ComWriter.DoBarrage',
-    'FeedCloudSvr.trpc.feedcloud.commwriter.ComWriter.DoComment',
-    'FeedCloudSvr.trpc.feedcloud.commwriter.ComWriter.DoFollow',
-    'FeedCloudSvr.trpc.feedcloud.commwriter.ComWriter.DoLike',
-    'FeedCloudSvr.trpc.feedcloud.commwriter.ComWriter.DoPush',
-    'FeedCloudSvr.trpc.feedcloud.commwriter.ComWriter.DoReply',
-    'FeedCloudSvr.trpc.feedcloud.commwriter.ComWriter.PublishFeed',
-    'FeedCloudSvr.trpc.videocircle.circleprofile.CircleProfile.SetProfile',
-    'GameCenterMsg.GetUserInfo',
-    'HttpConn.0x6ff_501',
-    'IncreaseURLSvr.QQHeadUrlReq',
-    'LightAppSvc.mini_app_cloudstorage.GetUserCloudStorage',
-    'LightAppSvc.mini_app_privacy.GetPrivacyInfo',
-    'LightAppSvc.mini_app_userapp.GetDropdownAppList',
-    'MQUpdateSvc_com_qq_qzone_act.web.OidbSvcTrpcJsapiTcp.0x9377_0',
-    'MQUpdateSvc_com_qq_ti.web.OidbSvcTrpcJsapiTcp.0x9044_0',
-    'MQUpdateSvc_com_qq_ti.web.OidbSvcTrpcJsapiTcp.0x9047_0',
-    'MQUpdateSvc_com_qq_ti.web.OidbSvcTrpcJsapiTcp.0x9172_0',
-    'MessageSvc.PbBindUinGetMsg',
-    'MessageSvc.PbGetGroupMsg',
-    'MessageSvc.PbGetMsg',
-    'MessageSvc.PbGetRoamMsg',
-    'MessageSvc.PbSendMsg',
-    'MsgProxy.SendMsg',
-    'NowSummaryCard.NearbyMiniCardReq',
-    'OidbSvc.0x42d',
-    'OidbSvc.0x42d_4',
-    'OidbSvc.0x480_9',
-    'OidbSvc.0x480_9_IMCore',
-    'OidbSvc.0x4ff_9',
-    'OidbSvc.0x4ff_9_IMCore',
-    'OidbSvc.0x515_2',
-    'OidbSvc.0x53c_2',
-    'OidbSvc.0x56c_6',
-    'OidbSvc.0x570_8',
-    'OidbSvc.0x580_1',
-    'OidbSvc.0x587_123',
-    'OidbSvc.0x587_normalNightSet',
-    'OidbSvc.0x58b',
-    'OidbSvc.0x592',
-    'OidbSvc.0x592_1',
-    'OidbSvc.0x592_10',
-    'OidbSvc.0x592_11',
-    'OidbSvc.0x592_12',
-    'OidbSvc.0x592_13',
-    'OidbSvc.0x592_15',
-    'OidbSvc.0x592_16',
-    'OidbSvc.0x592_17',
-    'OidbSvc.0x592_18',
-    'OidbSvc.0x592_19',
-    'OidbSvc.0x592_2',
-    'OidbSvc.0x592_3',
-    'OidbSvc.0x592_4',
-    'OidbSvc.0x592_5',
-    'OidbSvc.0x592_6',
-    'OidbSvc.0x592_7',
-    'OidbSvc.0x592_8',
-    'OidbSvc.0x592_9',
-    'OidbSvc.0x59f',
-    'OidbSvc.0x5d0_1',
-    'OidbSvc.0x5eb_15',
-    'OidbSvc.0x5eb_22',
-    'OidbSvc.0x5eb_42073',
-    'OidbSvc.0x5eb_42261',
-    'OidbSvc.0x5eb_43',
-    'OidbSvc.0x5eb_96',
-    'OidbSvc.0x5eb_99',
-    'OidbSvc.0x5eb_ForTheme',
-    'OidbSvc.0x5eb_cn_switch',
-    'OidbSvc.0x5eb_common',
-    'OidbSvc.0x6d6_0',
-    'OidbSvc.0x6d6_2',
-    'OidbSvc.0x6d6_3',
-    'OidbSvc.0x6d7_0',
-    'OidbSvc.0x6d9_4',
-    'OidbSvc.0x6de',
-    'OidbSvc.0x758',
-    'OidbSvc.0x758_0',
-    'OidbSvc.0x758_1',
-    'OidbSvc.0x787_0',
-    'OidbSvc.0x787_1',
-    'OidbSvc.0x787_11',
-    'OidbSvc.0x7a2_0',
-    'OidbSvc.0x7df_3',
-    'OidbSvc.0x852_35',
-    'OidbSvc.0x852_48',
-    'OidbSvc.0x88d_0',
-    'OidbSvc.0x88d_1',
-    'OidbSvc.0x88d_1_2',
-    'OidbSvc.0x88d_7',
-    'OidbSvc.0x899_0',
-    'OidbSvc.0x899_9',
-    'OidbSvc.0x89a_0',
-    'OidbSvc.0x89b_1',
-    'OidbSvc.0x8a0_0',
-    'OidbSvc.0x8a1_0',
-    'OidbSvc.0x8a1_7',
-    'OidbSvc.0x8a4',
-    'OidbSvc.0x8a8',
-    'OidbSvc.0x8ba',
-    'OidbSvc.0x8f1',
-    'OidbSvc.0x9fa',
-    'OidbSvc.0xb3c',
-    'OidbSvc.0xb3c_1',
-    'OidbSvc.0xb3c_2',
-    'OidbSvc.0xb3c_3',
-    'OidbSvc.0xb3c_4',
-    'OidbSvc.0xb3c_5',
-    'OidbSvc.0xb3c_6',
-    'OidbSvc.0xb3c_7',
-    'OidbSvc.0xb3c_8',
-    'OidbSvc.0xb3c_add',
-    'OidbSvc.0xb3c_delete',
-    'OidbSvc.0xb3c_get_by_id',
-    'OidbSvc.0xb3c_get_done',
-    'OidbSvc.0xb3c_get_done_count',
-    'OidbSvc.0xb3c_get_undone',
-    'OidbSvc.0xb3c_share',
-    'OidbSvc.0xb3c_update',
-    'OidbSvc.0xb3c_update_5',
-    'OidbSvc.0xb77_34',
-    'OidbSvc.0xb77_46',
-    'OidbSvc.0xb77_48',
-    'OidbSvc.0xb77_9',
-    'OidbSvc.0xbbb',
-    'OidbSvc.0xbcb',
-    'OidbSvc.0xbe8',
-    'OidbSvc.0xc26_0',
-    'OidbSvc.0xc33_42220',
-    'OidbSvc.0xc6b',
-    'OidbSvc.0xcd5',
-    'OidbSvc.0xcdd',
-    'OidbSvc.0xd69',
-    'OidbSvc.0xdc2_34',
-    'OidbSvc.0xdc2_9',
-    'OidbSvc.0xe27',
-    'OidbSvc.0xe3e',
-    'OidbSvc.0xe61',
-    'OidbSvc.0xe63_1',
-    'OidbSvc.0xe72',
-    'OidbSvc.0xef0_1',
-    'OidbSvc.0xf7e_1',
-    'OidbSvc.oidb_0x758',
-    'OidbSvcTRPCTcp.0x758_1',
-    'OidbSvcTRPCTcp.0xf67_1',
-    'OidbSvcTcp.0x102a',
-    'OidbSvcTcp.0x88d_0',
-    'OidbSvcTcp.0x88d_1',
-    'OidbSvcTcp.0xef0_1',
-    'OidbSvcTrpcTcp.0x1017_1',
-    'OidbSvcTrpcTcp.0x101b_1',
-    'OidbSvcTrpcTcp.0x101e_1',
-    'OidbSvcTrpcTcp.0x101e_2',
-    'OidbSvcTrpcTcp.0x102a_0',
-    'OidbSvcTrpcTcp.0x102a_1',
-    'OidbSvcTrpcTcp.0x102a_3',
-    'OidbSvcTrpcTcp.0x105b_1',
-    'OidbSvcTrpcTcp.0x1092_0',
-    'OidbSvcTrpcTcp.0x10c0_1',
-    'OidbSvcTrpcTcp.0x10c0_2',
-    'OidbSvcTrpcTcp.0x10c8_1',
-    'OidbSvcTrpcTcp.0x10c8_2',
-    'OidbSvcTrpcTcp.0x10d8_1',
-    'OidbSvcTrpcTcp.0x10db_1',
-    'OidbSvcTrpcTcp.0x10e4_1',
-    'OidbSvcTrpcTcp.0x10ed_1',
-    'OidbSvcTrpcTcp.0x10f4_1',
-    'OidbSvcTrpcTcp.0x1100_1',
-    'OidbSvcTrpcTcp.0x1102_1',
-    'OidbSvcTrpcTcp.0x1103_1',
-    'OidbSvcTrpcTcp.0x1105_1',
-    'OidbSvcTrpcTcp.0x1107_1',
-    'OidbSvcTrpcTcp.0x110d_1',
-    'OidbSvcTrpcTcp.0x112a_1',
-    'OidbSvcTrpcTcp.0x112a_2',
-    'OidbSvcTrpcTcp.0x112e_1',
-    'OidbSvcTrpcTcp.0x1130_1',
-    'OidbSvcTrpcTcp.0x116c_1',
-    'OidbSvcTrpcTcp.0x116d_1',
-    'OidbSvcTrpcTcp.0x1194_1',
-    'OidbSvcTrpcTcp.0x11c4_100',
-    'OidbSvcTrpcTcp.0x11c4_200',
-    'OidbSvcTrpcTcp.0x11c5_100',
-    'OidbSvcTrpcTcp.0x11c5_200',
-    'OidbSvcTrpcTcp.0x11e9_100',
-    'OidbSvcTrpcTcp.0x11e9_200',
-    'OidbSvcTrpcTcp.0x11ea_200',
-    'OidbSvcTrpcTcp.0x11ec_1',
-    'OidbSvcTrpcTcp.0x121e_0',
-    'OidbSvcTrpcTcp.0x1224_0',
-    'OidbSvcTrpcTcp.0x1225_0',
-    'OidbSvcTrpcTcp.0x123c_1',
-    'OidbSvcTrpcTcp.0x1250_0',
-    'OidbSvcTrpcTcp.0x1258_1',
-    'OidbSvcTrpcTcp.0x125b_500',
-    'OidbSvcTrpcTcp.0x1262_19',
-    'OidbSvcTrpcTcp.0x126d_200',
-    'OidbSvcTrpcTcp.0x126e_200',
-    'OidbSvcTrpcTcp.0x1277_0',
-    'OidbSvcTrpcTcp.0x127a_0',
-    'OidbSvcTrpcTcp.0x1289_1',
-    'OidbSvcTrpcTcp.0x12a9_200',
-    'OidbSvcTrpcTcp.0x12b1_0',
-    'OidbSvcTrpcTcp.0x55f_0',
-    'OidbSvcTrpcTcp.0x587_74',
-    'OidbSvcTrpcTcp.0x5cf_11',
-    'OidbSvcTrpcTcp.0x644_1',
-    'OidbSvcTrpcTcp.0x6d6_2',
-    'OidbSvcTrpcTcp.0x6d6_3',
-    'OidbSvcTrpcTcp.0x6d8_1',
-    'OidbSvcTrpcTcp.0x6d9_2',
-    'OidbSvcTrpcTcp.0x6d9_4',
-    'OidbSvcTrpcTcp.0x758_1',
-    'OidbSvcTrpcTcp.0x787_1',
-    'OidbSvcTrpcTcp.0x7c1_1',
-    'OidbSvcTrpcTcp.0x7c2_5',
-    'OidbSvcTrpcTcp.0x88d_0',
-    'OidbSvcTrpcTcp.0x88d_111',
-    'OidbSvcTrpcTcp.0x88d_14',
-    'OidbSvcTrpcTcp.0x899_0',
-    'OidbSvcTrpcTcp.0x899_1',
-    'OidbSvcTrpcTcp.0x899_9',
-    'OidbSvcTrpcTcp.0x89a_0',
-    'OidbSvcTrpcTcp.0x89a_15',
-    'OidbSvcTrpcTcp.0x8a0_1',
-    'OidbSvcTrpcTcp.0x8a1_7',
-    'OidbSvcTrpcTcp.0x8f9_14',
-    'OidbSvcTrpcTcp.0x8fc_3',
-    'OidbSvcTrpcTcp.0x901f_1',
-    'OidbSvcTrpcTcp.0x902e_1',
-    'OidbSvcTrpcTcp.0x9076_1',
-    'OidbSvcTrpcTcp.0x9078_1',
-    'OidbSvcTrpcTcp.0x9079_1',
-    'OidbSvcTrpcTcp.0x911a_19',
-    'OidbSvcTrpcTcp.0x911a_22',
-    'OidbSvcTrpcTcp.0x9124_0',
-    'OidbSvcTrpcTcp.0x9127_1',
-    'OidbSvcTrpcTcp.0x9144_1',
-    'OidbSvcTrpcTcp.0x9176_1',
-    'OidbSvcTrpcTcp.0x917b_1',
-    'OidbSvcTrpcTcp.0x91b6_1',
-    'OidbSvcTrpcTcp.0x929b_0',
-    'OidbSvcTrpcTcp.0x92d5_0',
-    'OidbSvcTrpcTcp.0x92e3_0',
-    'OidbSvcTrpcTcp.0x92e4_0',
-    'OidbSvcTrpcTcp.0x92eb_0',
-    'OidbSvcTrpcTcp.0x930d_0',
-    'OidbSvcTrpcTcp.0x930e_0',
-    'OidbSvcTrpcTcp.0x93d7_1',
-    'OidbSvcTrpcTcp.0x9409_10',
-    'OidbSvcTrpcTcp.0x9409_11',
-    'OidbSvcTrpcTcp.0x9409_12',
-    'OidbSvcTrpcTcp.0x9409_13',
-    'OidbSvcTrpcTcp.0x9409_14',
-    'OidbSvcTrpcTcp.0x9409_15',
-    'OidbSvcTrpcTcp.0x9409_16',
-    'OidbSvcTrpcTcp.0x9409_18',
-    'OidbSvcTrpcTcp.0x9409_7',
-    'OidbSvcTrpcTcp.0x9559_0',
-    'OidbSvcTrpcTcp.0x955f_1',
-    'OidbSvcTrpcTcp.0x9560_1',
-    'OidbSvcTrpcTcp.0x962a_1',
-    'OidbSvcTrpcTcp.0x9689_1',
-    'OidbSvcTrpcTcp.0x972_6',
-    'OidbSvcTrpcTcp.0x9a2_12',
-    'OidbSvcTrpcTcp.0x9a2_8',
-    'OidbSvcTrpcTcp.0xa80_1',
-    'OidbSvcTrpcTcp.0xaf6_0',
-    'OidbSvcTrpcTcp.0xb77_57',
-    'OidbSvcTrpcTcp.0xcd5',
-    'OidbSvcTrpcTcp.0xdc2_34',
-    'OidbSvcTrpcTcp.0xe37_1200',
-    'OidbSvcTrpcTcp.0xe37_1700',
-    'OidbSvcTrpcTcp.0xe37_700',
-    'OidbSvcTrpcTcp.0xe37_800',
-    'OidbSvcTrpcTcp.0xf55_1',
-    'OidbSvcTrpcTcp.0xf57_1',
-    'OidbSvcTrpcTcp.0xf57_106',
-    'OidbSvcTrpcTcp.0xf57_9',
-    'OidbSvcTrpcTcp.0xf59_1',
-    'OidbSvcTrpcTcp.0xf59_2',
-    'OidbSvcTrpcTcp.0xf5b_1',
-    'OidbSvcTrpcTcp.0xf5d_1',
-    'OidbSvcTrpcTcp.0xf5d_11',
-    'OidbSvcTrpcTcp.0xf65_1',
-    'OidbSvcTrpcTcp.0xf65_10',
-    'OidbSvcTrpcTcp.0xf67_1',
-    'OidbSvcTrpcTcp.0xf67_5',
-    'OidbSvcTrpcTcp.0xf6e_1',
-    'OidbSvcTrpcTcp.0xf88_1',
-    'OidbSvcTrpcTcp.0xf89_1',
-    'OidbSvcTrpcTcp.0xfa5_1',
-    'OidbSvcTrpcTcp.0xfc9_1',
-    'OidbSvcTrpcTcp.0xfd4_1',
-    'OidbSvcTrpcTcp.0xfe1',
-    'OidbSvcTrpcTcp.0xfe1_2',
-    'OidbSvcTrpcTcp.0xfe1_8',
-    'OidbSvcTrpcTcp.0xfe4_2',
-    'OidbSvcTrpcTcp.0xfe5_2',
-    'OidbSvcTrpcTcp.0xfe7_2',
-    'OidbSvcTrpcTcp.0xfe7_3',
-    'OidbSvcTrpcTcp.0xfe7_4',
-    'OidbSvc_device.0x633',
-    'OidbSvc_device.0x9f5',
-    'PbMessageSvc.PbUnReadMsgSeq',
-    'ProfileService.GetSimpleInfo',
-    'ProfileService.GroupMngReq',
-    'ProfileService.Pb.ReqSystemMsgAction.Group',
-    'ProfileService.Pb.ReqSystemMsgNew.Group',
-    'ProfileService.ReqBatchProcess',
-    'ProfileService.SimpleInfo',
-    'ProfileService.getGroupInfoReq',
-    'PttStore.GroupPttDown',
-    'PubAccountSvc.get_follow_list',
-    'PushService.settoken',
-    'QChannelSvr.trpc.qchannel.commreader.ComReader.BatchGetFeedDetail',
-    'QChannelSvr.trpc.qchannel.commwriter.ComWriter.DoComment',
-    'QChannelSvr.trpc.qchannel.commwriter.ComWriter.DoReply',
-    'QChannelSvr.trpc.qchannel.commwriter.ComWriter.PublishFeed',
-    'QQAIOMediaSvc.share_trans_check',
-    'QQConnectLogin.auth',
-    'QQConnectLogin.auth_emp',
-    'QQConnectLogin.get_promote_page',
-    'QQConnectLogin.get_promote_page_emp',
-    'QQConnectLogin.pre_auth',
-    'QQConnectLogin.pre_auth_emp',
-    'QQConnectLogin.submit_promote_page',
-    'QQConnectLogin.submit_promote_page_emp',
-    'QQLBSShareSvc.room_operation',
-    'QQRTCSvc.RoomManager-GetRoomInfo',
-    'QQStranger.FeedPlazaSvr.SsoFeedPublish',
-    'QQStranger.FeedSvr.SsoFeedPublish',
-    'QQStranger.InteractiveMsgSvr.SsoSendInterMsg',
-    'QQStranger.UserInfo.SsoBatchGetMiniUserInfo',
-    'QQStranger.UserInfo.SsoGetMiniUserInfo',
-    'QQStranger.UserInfo.SsoSetMiniUserInfo',
-    'QQStranger.login_svr.SsoLoginInfoReport',
-    'QSec.AVEng',
-    'RegPrxySvc.infoLogin',
-    'RegPrxySvc.infoSync',
-    'ResourceConfig.ClientReq',
-    'ResourceConfig.GetResourceReq',
-    'SQQzoneSvc.Custom.getFacade',
-    'SQQzoneSvc.GetCate',
-    'SQQzoneSvc.addComment',
-    'SQQzoneSvc.addReply',
-    'SQQzoneSvc.elaborateFeedReport',
-    'SQQzoneSvc.forward',
-    'SQQzoneSvc.get',
-    'SQQzoneSvc.getAIONewestFeeds',
-    'SQQzoneSvc.getActiveFeeds',
-    'SQQzoneSvc.getMainPage',
-    'SQQzoneSvc.getPhotoComment',
-    'SQQzoneSvc.getPhotoWall',
-    'SQQzoneSvc.getProfile',
-    'SQQzoneSvc.getProfileFeeds',
-    'SQQzoneSvc.getUndealCount',
-    'SQQzoneSvc.getVisitorNotify',
-    'SQQzoneSvc.get_all_feedsphoto_ex',
-    'SQQzoneSvc.like',
-    'SQQzoneSvc.mobileqboss.get',
-    'SQQzoneSvc.photo',
-    'SQQzoneSvc.preGetPassiveFeeds',
-    'SQQzoneSvc.publishmood',
-    'SQQzoneSvc.shuoshuo',
-    'SecuritySvc.GetConfig',
-    'SsoSnsSession.Cmd0x3_SubCmd0x1_FuncGetBlockList',
-    'StatSvc.GetDevLoginInfo',
-    'StatSvc.GetOnlineStatus',
-    'StatSvc.SetStatusFromClient',
-    'StatSvc.SimpleGet',
-    'StatSvc.register',
-    'SummaryCard.ReqSummaryCard',
-    'VisitorSvc.ReqDeleteVisitorRecord',
-    'VisitorSvc.ReqFavorite',
-    'WalletGestureSvc.GetPassword',
-    'WalletGestureSvc.GetSignV2',
-    'WalletGestureSvc.SetPassword',
-    'account.RequestQueryQQMobileContactsV3',
-    'friendlist.AddFriendReq',
-    'friendlist.GetFriendListReq',
-    'friendlist.GetLastLoginInfoReq',
-    'friendlist.GetMultiTroopInfoReq',
-    'friendlist.GetSimpleOnlineFriendInfoReq',
-    'friendlist.GetTroopAppointRemarkReq',
-    'friendlist.GetTroopListReqV2',
-    'friendlist.GetTroopMemberList',
-    'friendlist.GetTroopMemberListReq',
-    'friendlist.ModifyGroupInfoReq',
-    'friendlist.addFriend',
-    'friendlist.getFriendGroupList',
-    'friendlist.getTroopMemberList',
-    'gcbindgroupsso.get_appid',
-    'gcbindgroupsso.unbind_group',
-    'group_member_card.get_group_member_card_info',
-    'group_member_statistic.get_group_member_statistic',
-    'miniapp.trpc.minigame.sdk_qgroup_svr.sdk_qgroup_svr.JoinGroup',
-    'oidb_0x42e_3',
-    'oidb_0x43c_4',
-    'oidb_0x43c_5',
-    'oidb_0x5d0_1',
-    'oidb_0x5d6_19',
-    'oidb_0x5d6_21',
-    'oidb_0x7a2_0',
-    'oidb_0x7c4_0',
-    'oidb_0x7df_3',
-    'oidb_0x9045_1',
-    'oidb_0x9072_0',
-    'oidb_0xcf3_0',
-    'oidb_0xcf4_0',
-    'oidb_0xd9c_11',
-    'oidb_0xdc2_34',
-    'oidb_0xe37_1200',
-    'oidb_0xe37_800',
-    'oidb_0xe61_1',
-    'oidb_0xe8c_0',
-    'oidb_0xeb1_1',
-    'oidb_0xf7e_1',
-    'oidb_0xfd4_1',
-    'qidianservice.135',
-    'qidianservice.207',
-    'qidianservice.269',
-    'qidianservice.290',
-    'qzoneh5.h5.wnshtml',
-    'trpc.QQService.CommonLogic.StatusService.SsoGetLikeList',
-    'trpc.commercial.dataworks.UserActionReport_sso.SsoReport',
-    'trpc.down.intercept.Intercept.SsoGetDownloadTips',
-    'trpc.down.intercept.Intercept.SsoGetInterceptFile',
-    'trpc.down.joint_operation_game_intercept.JointOperationGameIntercept.SsoCheck',
-    'trpc.down.joint_operation_game_intercept.JointOperationGameIntercept.SsoQueryConfig',
-    'trpc.ecom.api_gateway.ApiGateway.SsoForward',
-    'trpc.g_qqrtc.qq_mav_room_state_read.GetRoomState.SsoGetInfoByUin',
-    'trpc.gc_indust.device_report.SsoHome.SsoHomeReport',
-    'trpc.group.long_msg_interface.MsgService.SsoRecvLongMsg',
-    'trpc.group.long_msg_interface.MsgService.SsoSendLongMsg',
-    'trpc.group_pro.msgproxy.sendmsg',
-    'trpc.group_pro.synclogic.SyncLogic.SyncFirstView',
-    'trpc.login.ecdh.EcdhService.SsoKeyExchange',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginAuthCodeLogin',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginAuthLogin',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginAuthNewDevice',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginCheckA1List',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginCheckGateWayCode',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginCheckSms',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginCheckThirdCode',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginEasyLogin',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginEasyLoginUnusualDevice',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginGetSaltList',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginGetSms',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginOptimusLogin',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginPasswordLogin',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginPasswordLoginNewDevice',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginPasswordLoginUnusualDevice',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginRapidLogin',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginRefreshA2',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginRefreshTicket',
-    'trpc.login.ecdh.EcdhService.SsoNTLoginTGTExchangeFastLogin',
-    'trpc.login.ecdh.EcdhService.SsoOIDB0x916a',
-    'trpc.login.ecdh.EcdhService.SsoOIDB0x916b',
-    'trpc.login.ecdh.EcdhService.SsoOIDB0x916c',
-    'trpc.login.ecdh.EcdhService.SsoOIDB0x916d',
-    'trpc.login.ecdh.EcdhService.SsoQRLoginAuthQr',
-    'trpc.login.ecdh.EcdhService.SsoQRLoginCancleQr',
-    'trpc.login.ecdh.EcdhService.SsoQRLoginGenQr',
-    'trpc.login.ecdh.EcdhService.SsoQRLoginRejectQr',
-    'trpc.login.ecdh.EcdhService.SsoQRLoginScanQr',
-    'trpc.lplan.feed_svr.StatusWrite.SsoComment',
-    'trpc.lplan.feed_svr.StatusWrite.SsoPostStatus',
-    'trpc.lplan.feed_svr.StatusWrite.SsoReply',
-    'trpc.lplan.like_svr.Like.SsoDoLike',
-    'trpc.lplan.map_svr.Map.SsoReportLocation',
-    'trpc.lplan.user_manager_svr.User.SsoLogin',
-    'trpc.lplan.user_manager_svr.User.SsoSetProfile',
-    'trpc.metaverse.mob_proxy_svr.MobProxy.SsoHandle',
-    'trpc.msg.msg_svc.MsgService.SsoC2CRecallMsg',
-    'trpc.msg.msg_svc.MsgService.SsoGetPeerSeq',
-    'trpc.msg.msg_svc.MsgService.SsoReadedReport',
-    'trpc.msg.olpush.OlPushService.SsoPushAck',
-    'trpc.msg.register_proxy.RegisterProxy.PushParams',
-    'trpc.msg.register_proxy.RegisterProxy.SsoInfoSync',
-    'trpc.o3.ecdh_access.EcdhAccess.SsoEstablishShareKey',
-    'trpc.o3.ecdh_access.EcdhAccess.SsoSecureA2Access',
-    'trpc.o3.ecdh_access.EcdhAccess.SsoSecureA2Establish',
-    'trpc.o3.ecdh_access.EcdhAccess.SsoSecureAccess',
-    'trpc.o3.report.Report.SsoReport',
-    'trpc.passwd.manager.PasswdManager.SetPasswd',
-    'trpc.passwd.manager.PasswdManager.VerifyPasswd',
-    'trpc.qlive.qlive_proxy_svr.TrpcProxy.*',
-    'trpc.qlive.relationchain_svr.RelationchainSvr.Follow',
-    'trpc.qlive.word_svr.WordSvr.NewPublicChat',
-    'trpc.qmeta.mob_proxy_svr.MobProxy.SsoHandle',
-    'trpc.qpay.encryptedtransfer.Encryption.SsoUINEncrypt',
-    'trpc.qpay.midas_order.Order.SsoMakeOrder',
-    'trpc.qpay.red_pack_skin.Skin.SsoAddSkin',
-    'trpc.qpay.sso.web.Do',
-    'trpc.qq_new_tech.status_svc.StatusService.Register',
-    'trpc.qq_new_tech.status_svc.StatusService.SetStatus',
-    'trpc.qq_new_tech.status_svc.StatusService.SsoHeartBeat',
-    'trpc.qq_new_tech.status_svc.StatusService.UnRegister',
-    'trpc.qqhb.qqhb_proxy.Handler.sso_handle',
-    'trpc.qqstranger.common_proxy.CommonProxy.SsoHandle',
-    'trpc.qqva.vipdata.Vipdata.SsoGetUserData',
-    'trpc.springfestival.redpacket.LuckyBag.SsoSubmitGrade',
-    'wtlogin.device_lock',
-    'wtlogin.exchange_emp',
-    'wtlogin.log_report',
-    'wtlogin.login',
-    'wtlogin.name2uin',
-    'wtlogin.qrlogin',
-    'wtlogin.register',
-    'wtlogin.trans_emp',
-    'wtlogin_device.login',
-    'wtlogin_device.tran_sim_emp'
-  ])
-
-  async sendCommand(cmd: string, payload: Buffer, encryptType?: EncryptType, timeout = 15000, skipSign = false): Promise<SsoPacket> {
+  async sendCommand(cmd: string, payload: Buffer, encryptType?: EncryptType, timeout = 15000, skipSign = false, signTokenOverride?: string): Promise<SsoPacket> {
     if (this.unsupportedCmds.has(cmd)) throw new CmdNotPermittedError(cmd)
+    if (!isCmdAllowed(cmd)) throw new CmdBlockedError(cmd)
     const seq = this.nextSeq()
     const session = this.session
     const ctx = this.getPacketContext()
@@ -826,14 +442,16 @@ export class DirectProtocolClient extends EventEmitter {
 
     // watch trans_emp 必须不签名 (签了服务器拒扫码授权); 桌面 trans_emp 照常签。skipSign 由调用方按协议传。
     let signResult: SignResult | null = null
-    if (!skipSign && this.config.authToken && this.SIGN_ALLOWLIST.has(cmd)) {
+    if (!skipSign && this.config.authToken && cmdNeedsSign(cmd, getActiveProfile().name)) {
       // uin 优先 session (登录成功后), 未登录时 fallback 到构造时传的 config.uin.
       // 快速登录场景 session 解不开时 session 为 null, 但 config.uin 已从明文元数据 / -q 拿到,
       // 缺了它 sign 服务器会 400 'missing uin' 直接拒
       const uin = this.session?.uin ? Number(this.session.uin) : (this.config.uin || undefined)
       await this.ensureSignTokenFresh(uin)
       tTokenDone = Date.now()
-      const protocolToken = this.protocolTokenFor(cmd)
+      // [SA 1001 修复] signTokenOverride (SA=token1) 优先于 session token: SA 命令必须用 token1
+      // 签 (真机 SecInfo sf2=token1), 而此刻 session.signToken12B 还空 (正在取 token)。
+      const protocolToken = signTokenOverride ?? this.protocolTokenFor(cmd)
       signResult = await requestSign(cmd, payload, seq, this.guid, AppInfo.qua, uin, protocolToken)
       tSignDone = Date.now()
       if (signResult?.token.length === 0) {
@@ -852,11 +470,6 @@ export class DirectProtocolClient extends EventEmitter {
       throw new Error('QQ session changed before the command could be sent')
     }
     const packet = buildServicePacket(seq, cmd, ctx, payload, enc, signResult)
-
-    // 调试用: 出网前 dump SSO frame, 跟真机抓包对照定位 sign 不一致的字节差异.
-    if (cmd.includes('o3.ecdh_access') || cmd === 'wtlogin.login' || cmd === 'wtlogin.trans_emp') {
-      logger.debug(`[SSO send] ${cmd} seq=${seq} frame=${packet.length}B hex=%h`, packet)
-    }
 
     const tSendStart = Date.now()
     return new Promise((resolve, reject) => {
@@ -927,6 +540,9 @@ export class DirectProtocolClient extends EventEmitter {
       return
     }
 
+    // 真机: 新建 SSO 连接时服务器推 ConfigPushSvc.PushReq, 客户端回 PushResp 回显 {type,seq}。
+    if (parsed.cmd === CONFIG_PUSH_REQ) this.respondConfigPush(parsed.payload)
+
     this.emit('push', parsed)
   }
 
@@ -983,8 +599,95 @@ export class DirectProtocolClient extends EventEmitter {
 
   setSession(session: SessionInfo): void {
     this.session = session
+    recordKey('d2Key', session.d2Key, `TEA key of every EncryptD2Key SSO frame (uin ${session.uin})`)
+    recordKey('d2', session.d2, 'SSO head credential, not a key')
+    recordKey('tgt', session.tgt, 'SSO head credential, not a key')
+    recordKey('a2Key', session.a2Key, 'from TLV 0x10D')
     this.emit('login', session)
     void this.tryAcquireSignToken()
+    // SsoReport 遥测 loop 不在 setSession 起: 此刻 ESK/SA/SsoInfoSync 都没跑, 在这里起会让报告
+    // (尤其大的 verify_file) 渗进握手、怼在 SA 之后 -> 跟真机不符 (真机 SA 之后全是小 enc01 帧,
+    // 没有 verify_file 尺寸的帧)。改由 direct.ts 在 registerOnline 上线成功后调 startLinuxSsoReportLoop(),
+    // 对齐"先 ESK->SA 拿 token、再 SsoInfoSync 上线、再开遥测"的真机时序。
+  }
+
+  async startLinuxSsoReportLoop(): Promise<void> {
+    if (getActiveProfile().name !== 'linux' || !this.session || !this.config.authToken) return
+    await startLinuxSsoReport({
+      qua: AppInfo.qua,
+      guidHex: this.guid.toString('hex'),
+      uin: this.session.uin,
+    })
+    // xwid 登录突发: 原生 send path 连号快发, 复刻真机登录爆发。非阻塞背景执行 (预签在后台跑,
+    // 完再一次性 blast), 条数 LINUX_XWID_BURST (env 可调, 默认见常量定义)。
+    if (LINUX_XWID_BURST > 0) {
+      const body = buildLinuxXwidBody(AppInfo.qua)
+      if (body) void this.sendXwidBurst(LINUX_XWID_BURST, body)
+    }
+    // 稳态遥测 loop: 真机登录后每 ~316s 发 getNewFlag/ClientReport/psKey, 补 Bot 的"哑连接"缺口。
+    this.startTelemetryLoop()
+    // 低频 aux 遥测: 真机 ~27min 偶发的 0x102a_1/0x116d_1/0x9067_202/SsoGetConfig。
+    this.startAuxTelemetryLoop()
+  }
+
+  /**
+   * Linux xwid 登录突发: 复刻真机登录瞬间的 xwid 连号发 (实测 ~1ms/包、~1000/s、摊 ~2.5s; 非"微秒瞬时")。
+   *   1. 批量签: 一次 NAPI (signLinuxXwidBurst) 里 Rust 循环签 count 条 (sign-core ~450k/s, 各条 ts+1ms
+   *      -> sign 各异)。取代逐条 requestSign 打 count 次 JS↔NAPI 往返 —— 那才是唯一慢点, 签名本身不慢。
+   *   2. 预留连续 seq 段 (JS 单线程无 await 介入 = 原子; 别的 send 拿 base+count 之后的 seq, 不插本段)。
+   *   3. 组帧 + conn.send, 分块 pace 到 LINUX_XWID_BURST_RATE (默认 1000/s 对齐真机, 避免瞬发尖峰踩限流);
+   *      **不登记 pendingPackets** (fire-and-forget: 服务端对 SsoReport 基本不回, 偶尔回也因无 pending 静默丢)。
+   * 非阻塞: 调用方 void 触发, 批量签 + 分块 pace 全在后台跑。
+   */
+  async sendXwidBurst(count: number, body: Buffer): Promise<void> {
+    if (count <= 0 || !body?.length) return
+    const cmd = 'trpc.o3.report.Report.SsoReport'
+    if (!this.isConnected || !this.session || !this.config.authToken) return
+    if (!cmdNeedsSign(cmd, getActiveProfile().name)) return
+    const session = this.session
+    const uin = this.session.uin ? Number(this.session.uin) : (this.config.uin || undefined)
+    // burst 用真 session token 签 (对齐真机: emptyToken 之后 ESK 已回, xwid 带 token1)。ensureSignTokenFresh
+    // 在 acquire 仍 in-flight 时会立即放行(空 token), 故再显式等一次 in-flight 完成, 保证整批用真 token1。
+    // burst 不在 acquire 的发包路径上, 不触发那个"等自己"死锁。
+    await this.ensureSignTokenFresh(uin)
+    if (this.signTokenRefreshInflight) { try { await this.signTokenRefreshInflight } catch { /* 取失败退化空 token */ } }
+    if (this.session !== session || !this.isConnected) return
+
+    // 1. 预留连续 seq 段 (原子)
+    const base = this.seq
+    this.seq = (this.seq + count) >>> 0
+    const token = this.protocolTokenFor(cmd)
+
+    // 2. 批量签 (一次 NAPI). 老 .node 无 signXwidBurst -> 返 null, 跳过突发 (不回退逐条, 免 count 次 NAPI)。
+    const sigs = await signLinuxXwidBurst({
+      cmd,
+      bodyHex: body.toString('hex'),
+      seq: base,
+      guidHex: this.guid.toString('hex'),
+      qua: AppInfo.qua,
+      uin: uin ?? 0,
+      protocolTokenHex: token ? Buffer.from(token, 'utf-8').toString('hex') : '',
+    }, count)
+    if (!sigs || sigs.length === 0) return
+    if (this.session !== session || !this.isConnected) return
+
+    // 3. 组帧 + 分块 pace 发送 (默认 ~1000/s 对齐真机); 不登记响应等待
+    const ctx = this.getPacketContext()
+    const CHUNK = 20
+    const chunkDelayMs = LINUX_XWID_BURST_RATE >= 100000 ? 0 : Math.max(0, Math.round((1000 * CHUNK) / LINUX_XWID_BURST_RATE))
+    let sent = 0
+    for (let i = 0; i < sigs.length; i++) {
+      if (this.session !== session || !this.isConnected) break // 断开/换会话 -> 停
+      const seq = (base + i) >>> 0
+      try {
+        this.conn.send(buildServicePacket(seq, cmd, ctx, body, EncryptType.EncryptD2Key, sigs[i]))
+        sent++
+      } catch { break }
+      if (chunkDelayMs > 0 && (i + 1) % CHUNK === 0) {
+        await new Promise((r) => setTimeout(r, chunkDelayMs))
+      }
+    }
+    logger.debug(`[xwid-burst] sent ${sent}/${count} (seq ${base}..${(base + count - 1) >>> 0}, rate~${LINUX_XWID_BURST_RATE}/s)`)
   }
 
   /**
@@ -996,6 +699,25 @@ export class DirectProtocolClient extends EventEmitter {
     const uin = Number(this.session.uin)
     if (!Number.isFinite(uin) || uin <= 0) return
     await this.ensureSignTokenFresh(uin)
+  }
+
+  /**
+   * [SA 1001 测试 B] 阻塞等到本次登录的 o3 sign-token 获取 (ESK -> SA) 跑完。
+   * setSession 已 void 触发 tryAcquireSignToken (fire-and-forget); 这里确保在 registerOnline
+   * (SsoInfoSync 上线) **之前** token 链已完成 —— 对齐 QQ 真机时序 (先 ESK->SA 拿 token 再上线),
+   * Bot 原来先上线再取 token, 怀疑是 SA 1001 主因。幂等 (in-flight lock) + 不抛 (失败走原回退)。
+   */
+  async awaitSignTokenAcquire(): Promise<void> {
+    if (!this.session || !this.config.authToken) return
+    const uin = Number(this.session.uin)
+    if (!Number.isFinite(uin) || uin <= 0) return
+    await this.ensureSignTokenFresh(uin)
+    // ensureSignTokenFresh 命中 re-entrancy/in-flight guard 时会提前 return 不 await,
+    // 这里显式 await setSession 先触发的那个 in-flight promise, 保证 ESK->SA 真跑完。
+    const inflight = this.signTokenRefreshInflight
+    if (inflight) {
+      try { await inflight } catch { /* 失败按原回退, 不阻断登录 */ }
+    }
   }
 
   /**
@@ -1034,6 +756,7 @@ export class DirectProtocolClient extends EventEmitter {
           this.session.signToken12B = token
           this.session.signTokenExpiresAt = Date.now() + ttlSecs * 1000
           logger.info(`[SignToken] acquired "${token}" ttl=${ttlSecs}s`)
+          recordKey('signToken12B', Buffer.from(token, 'utf-8'), `sign device token, ttl=${ttlSecs}s`)
         }
       } catch (e) {
         // 首拉失败: expiresAt 仍 undefined, 下条 allowlist 命令会再试一次首拉。
@@ -1047,5 +770,6 @@ export class DirectProtocolClient extends EventEmitter {
 
   clearSession(): void {
     this.session = null
+    stopLinuxSsoReport()
   }
 }

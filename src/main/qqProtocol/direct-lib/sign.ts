@@ -212,23 +212,100 @@ async function acquireViaManager(uin: number, qua: string): Promise<{ token: str
 let warnedStaleLinuxNode = false
 
 /**
- * Linux ESK 在 SignProxy 本地做: 组包 / 解包都不经 manager, 省掉每次取 token 的两趟 HTTP。
+ * Linux ESK -> SA 在 SignProxy 本地做: 先 ESK 拿 token1, 再 SA 换 token2 (登录态活跃 sign-token),
+ * 组包 / 解包都不经 manager, 省掉每次取 token 的两趟 HTTP。
  * device_pb 用的是 SDK 初始化时采的那份设备事实 (服务端会交叉校验自洽性, 不能另采)。
  *
- * 老 .node 没 getLinuxEskToken 时退回经 manager 的老路 —— manager 那两个端点为老版本保留着,
+ * 老 .node 没 getLinuxSAToken 时退回经 manager 的老路 —— manager 那两个端点为老版本保留着,
  * 退回去照样能用, 不至于因为 .node 没同步就拿不到 token。
  */
 async function acquireLinuxSignToken(uin: number, qua: string): Promise<{ token: string; ttlSecs: number }> {
   const proxy = getSignProxy()
-  if (typeof proxy.getLinuxEskToken !== 'function') {
+  if (typeof proxy.getLinuxSAToken !== 'function') {
     if (!warnedStaleLinuxNode) {
       warnedStaleLinuxNode = true
-      logger.warn('[SignToken] sign-proxy .node 过旧 (缺 getLinuxEskToken), 暂退回经 manager 取 token; 请重新 build 并 sync-to-bot')
+      logger.warn('[SignToken] sign-proxy .node 过旧 (缺 getLinuxSAToken), 暂退回经 manager 取 token; 请重新 build 并 sync-to-bot')
     }
     return acquireViaManager(uin, qua)
   }
-  const r = await proxy.getLinuxEskToken({ qua })
+  const r = await proxy.getLinuxSAToken({ qua })
+  // [esk-inner-sample] 旁路采样 (不参与过期计算): 记 ESK 内层两个候选时间戳 + outerTtl。
+  // 多次登录攒样本后离线判别: f3 / f4Ts 是相对 TTL 还是绝对时间戳、哪个是 token 到期。
+  const nowS = Math.floor(Date.now() / 1000)
+  const f3 = r.eskInnerF3 ?? 0
+  const f4Ts = r.eskInnerTokenTs ?? 0
+  logger.info(
+    `[esk-inner-sample] now=${nowS} outerTtl=${r.ttlSecs} f2=${r.eskInnerF2 ?? 0} ` +
+      `f3=${f3} (f3-now=${f3 ? Math.round(f3 - nowS) : 0}) ` +
+      `f4Ts=${f4Ts} (f4Ts-now=${f4Ts ? Math.round(f4Ts - nowS) : 0})`,
+  )
   return { token: r.token, ttlSecs: r.ttlSecs || DEFAULT_TOKEN_TTL_SECS }
+}
+
+let warnedNoSsoReport = false
+
+export async function startLinuxSsoReport(args: { qua: string; guidHex: string; uin: string }): Promise<void> {
+  if (!inited) return
+  const proxy = getSignProxy()
+  if (typeof proxy.startSsoReportLinux !== 'function') {
+    if (!warnedNoSsoReport) {
+      warnedNoSsoReport = true
+      logger.warn('[SsoReport] sign-proxy .node 过旧 (缺 startSsoReportLinux), 跳过 o3 遥测; 请重新 build 并 sync-to-bot')
+    }
+    return
+  }
+  try {
+    await proxy.startSsoReportLinux({ qua: args.qua, guidHex: args.guidHex, uin: args.uin })
+    logger.info('[SsoReport] Linux o3 遥测循环已启动')
+  } catch (e) {
+    logger.warn(`[SsoReport] 启动失败: ${(e as Error).message}`)
+  }
+}
+
+export function stopLinuxSsoReport(): void {
+  if (!inited) return
+  const { stopSsoReport } = getSignProxy()
+  if (typeof stopSsoReport !== 'function') return
+  try {
+    stopSsoReport()
+  } catch (e) {
+    logger.warn(`[SsoReport] 停止失败: ${(e as Error).message}`)
+  }
+}
+
+/**
+ * 取 Linux xwid 的常量 body (给 client.sendXwidBurst 做登录连号突发)。
+ * 老 .node 缺 buildXwidBody 时返 null (调用方跳过突发)。reportId 缺省 = 跨装机常量。
+ */
+export function buildLinuxXwidBody(qua: string, reportId?: string): Buffer | null {
+  if (!inited) return null
+  const proxy = getSignProxy()
+  if (typeof proxy.buildXwidBody !== 'function') return null
+  try {
+    return proxy.buildXwidBody(qua, reportId ?? null)
+  } catch (e) {
+    logger.warn(`[xwid-burst] buildXwidBody 失败: ${(e as Error).message}`)
+    return null
+  }
+}
+
+/**
+ * Linux xwid 登录突发批量签: 一次 NAPI 调用出 count 个各异 sign (取代逐条 signRequest 的 count 次往返)。
+ * 老 .node 缺 signXwidBurst 时返 null (调用方跳过突发)。
+ */
+export async function signLinuxXwidBurst(args: {
+  cmd: string; bodyHex: string; seq: number; guidHex: string; qua: string; uin: number; protocolTokenHex: string
+}, count: number): Promise<SignResult[] | null> {
+  if (!inited || count <= 0) return null
+  const proxy = getSignProxy()
+  if (typeof proxy.signXwidBurst !== 'function') return null
+  try {
+    const arr = await proxy.signXwidBurst(args, count)
+    return arr.map((r) => ({ sign: r.sign, token: r.token, extra: r.extra }))
+  } catch (e) {
+    logger.warn(`[xwid-burst] signXwidBurst 失败: ${(e as Error).message}`)
+    return null
+  }
 }
 
 /**

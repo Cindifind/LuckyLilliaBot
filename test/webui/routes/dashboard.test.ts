@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { createTestApp } from '../helpers/testApp'
 import { createMockContext } from '../helpers/mockContext'
 import { createDashboardRoutes } from '@/webui/BE/routes/dashboard'
+import { getProtocol, isPmhqMode } from '@/common/utils/environment'
 
 describe('dashboard routes', () => {
   let ctx: ReturnType<typeof createMockContext>
@@ -48,7 +49,46 @@ describe('dashboard routes', () => {
       expect(body.data.messageReceived).toBe(100)
       expect(body.data.messageSent).toBe(50)
       expect(body.data.bot).toBeDefined()
-      expect(body.data.qq).toBeDefined()
+      expect(body.data.qq.memory).toBe(500000000)
+      expect(body.data.qq.cpu).toBe(1.5)
+    })
+
+    it('omits qq when the protocol cannot read the QQ process', async () => {
+      mockAppReady()
+      ctx.qqProtocol.getQQResourceUsage.mockResolvedValue(null)
+      const data = await stats()
+      expect(data.qq).toBeUndefined()
+      expect(data.system).toBeDefined()
+    })
+
+    function mockAppReady() {
+      ctx.get.mockImplementation((key: string) => {
+        if (key === 'app') return { messageReceivedCount: 0, messageSentCount: 0, startupTime: 0, lastMessageTime: 0 }
+        if (key === 'qqProtocol') return ctx.qqProtocol
+        return undefined
+      })
+    }
+
+    async function stats() {
+      const res = await createTestApp(createDashboardRoutes(ctx)).request('/dashboard/stats')
+      return (await res.json()).data
+    }
+
+    // environment 整个模块被 test/unit/setup.ts mock 掉了, 改 process.argv 不生效
+    it('reports the active protocol in direct mode', async () => {
+      mockAppReady()
+      vi.mocked(getProtocol).mockReturnValue('macos')
+      const data = await stats()
+      expect(data.mode).toBe('direct')
+      expect(data.protocol).toBe('macos')
+    })
+
+    it('omits the protocol in PMHQ mode', async () => {
+      mockAppReady()
+      vi.mocked(isPmhqMode).mockReturnValue(true)
+      const data = await stats()
+      expect(data.mode).toBe('pmhq')
+      expect(data.protocol).toBeUndefined()
     })
   })
 

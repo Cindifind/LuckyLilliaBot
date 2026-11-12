@@ -94,10 +94,24 @@ interface Native {
   acquireSignToken(args: AcquireSignTokenArgs): Promise<AcquireSignTokenResult>
   postEnvelope(args: PostEnvelopeArgs): Promise<string>
   /**
-   * Linux ESK: 用 SDK 采的设备事实本地组 device_pb + request, 走 bot 自己的 SSO 发, 本地解 token。
-   * 不经 manager (acquireSignToken 那条要打 manager 两趟 HTTP)。老 .node 没这个 export 时为 undefined。
+   * Linux ESK -> SA: 用 SDK 采的设备事实本地组 device_pb, 先 ESK 拿 token1, 再 SA 换 token2
+   * (登录态活跃 sign-token), 返回 token2。走 bot 自己的 SSO 发, 本地解, 不经 manager
+   * (acquireSignToken 那条要打 manager 两趟 HTTP)。老 .node 没这个 export 时为 undefined。
    */
-  getLinuxEskToken?(args: LinuxEskTokenArgs): Promise<LinuxTokenResult>
+  getLinuxSAToken?(args: LinuxEskTokenArgs): Promise<LinuxTokenResult>
+  startSsoReportLinux?(args: StartSsoReportLinuxArgs): Promise<void>
+  stopSsoReport?(): void
+  /**
+   * 取 Linux SsoReport 的 xwid body (常量 protobuf)。Bot 侧 sendXwidBurst 用它做登录连号突发:
+   * body 恒定, 每帧只 sign(ts 各异) 不同。reportId 缺省 = 跨装机常量 "0df00071646"。
+   * 同步返回 Buffer。老 .node 没这个 export 时为 undefined。
+   */
+  buildXwidBody?(qua: string, reportId?: string | null): Buffer
+  /**
+   * Linux xwid 登录突发**批量签**: 一次调用返回 count 个各异 sign (Rust 循环, ~450k/s, count=2500≈5ms)。
+   * 取代 Bot 逐条 signRequest 打 count 次 NAPI 往返 (那才是慢的根源)。老 .node 没这个 export 时为 undefined。
+   */
+  signXwidBurst?(args: SignRequestArgs, count: number): Promise<SignResultJs[]>
   // ---- macOS o3 链 (全部本地组包, 只借 sendPacket 走 bot 自己的 SSO) ----
   // 老 .node 没这几个 export 时为 undefined, 调用前先判一下再报"请重新 build"。
   /** qimei 取号。打 StarTrail, 走**本机**网络出口 (服务端代取会把全站设备注册到同一 IP)。 */
@@ -122,6 +136,22 @@ export interface LinuxTokenResult {
   token: string
   /** ESK 响应 field 3 的 TTL(秒); 没解析到是 0 —— 调用方别直接拿 0 算过期时间。 */
   ttlSecs: number
+  /** 诊断 (攒样本定 TTL 语义, 不参与过期计算): ESK 内层明文 field2 原值; 老 .node 无此字段。 */
+  eskInnerF2?: number
+  /** 诊断: ESK 内层 field3 (相对 TTL 或绝对时间戳, 待定)。 */
+  eskInnerF3?: number
+  /** 诊断: ESK 内层 field4 子消息里跟 token 同级的时间戳。 */
+  eskInnerTokenTs?: number
+}
+
+export interface StartSsoReportLinuxArgs {
+  qua: string
+  guidHex: string
+  uin: string
+  reportId?: string
+  loginXwidBurst?: number
+  verifyFileIntervalMs?: number
+  uiReportMetric?: string
 }
 
 export interface MacosQimeiArgs {
@@ -187,6 +217,9 @@ export interface InitArgs {
 export interface RelayPacket {
   cmd: string
   body: Buffer
+  /** [SA 1001 修复] 本命令签名用的 12B sign-token (SecInfo sf2); 仅 SA 带 = token1。
+   *  缺省 = Bot 用 session 默认 token (ESK/其它命令走这条)。 */
+  signToken?: string
 }
 
 /** SDK logger 回调入参: level 是 "warn" / "error". 401/403 fatal 时 SDK 报 error 然后 exit. */

@@ -35,7 +35,10 @@ export const LINUX_PROFILE: ProtocolProfile = {
   vendorOs: 'linux',
   devType: 'Linux',
   osVer: 'Ubuntu 22.04 LTS',
-  systemKernel: '5.15.0',
+  // SsoInfoSync device f3 = `uname -v` (full build string), NOT `uname -r`. Real QQ 3.2.28
+  // sends e.g. "#1 SMP Tue Nov 5 00:21:55 UTC 2024"; the old "5.15.0" was uname -r = wrong
+  // field shape, a fingerprint tell (aligned to real capture 2026-10-05).
+  systemKernel: '#1 SMP Tue Nov 5 00:21:55 UTC 2024',
   vendorName: '',
   vendorOsName: 'linux',
   imPlat: 1,
@@ -44,12 +47,15 @@ export const LINUX_PROFILE: ProtocolProfile = {
   wtLoginCipherSuite: 0x0102,
   wtLoginServerPub: WTLOGIN_SERVER_PUB_192K1,
 
-  // 保持与原 login.ts 硬编码一致 (19 / appClientVersion) -> Linux 帧逐字节不变
+  // wtlogin 帧头: frameByte=19(0x13), frameVer=0x3374(13172)。
+  // frameVer 实证(PMHQ hook 真机 3.2.28 trans_emp/wtlogin.login 帧头 `1300 003374`):
+  // 真机是固定值 0x3374, 不是 appClientVersion(48517=0xbd85)。旧值 48517 是误抄 appClientVer,
+  // 登录能过但帧头跟真机不一致(Windows PoC 同款 0x3374, 见 poc-vs-linux-packet-structure.md)。
   wtLoginFrameByte: 19,
-  wtLoginFrameVer: 48517,
+  wtLoginFrameVer: 13172,
 
   ssoProtocolVersion: 12,
-  reserveVariant: 'nt',
+  reserveVariant: 'linux',
 }
 
 export { WTLOGIN_SERVER_PUB_192K1 }

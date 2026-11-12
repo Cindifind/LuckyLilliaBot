@@ -5,10 +5,13 @@ import type {
   PMHQRes,
   PMHQReq,
   PMHQResSendPB,
+  PMHQHealth,
   PBData,
+  QQResourceUsage,
   ResListener,
 } from './types'
 import { Context } from 'cordis'
+import { getPmhqTarget } from '@/common/utils/environment'
 import { buildSsoInfoSync } from './direct-lib'
 import { QQProtocolBase } from './base'
 
@@ -30,16 +33,23 @@ export class PmhqQQProtocol extends QQProtocolBase {
 
   constructor(ctx: Context) {
     super(ctx)
-    const { pmhqHost, pmhqPort } = this.getPMHQHostPort()
-    this.httpUrl = `http://${pmhqHost}:${pmhqPort}/`
-    this.wsUrl = `ws://${pmhqHost}:${pmhqPort}/ws`
+    // 只有 isPmhqMode() 为真才会 plugin 到这个类, ?? 分支实际走不到, 纯为类型收口
+    const { host, port } = getPmhqTarget() ?? { host: '127.0.0.1', port: '13000' }
+    this.httpUrl = `http://${host}:${port}/`
+    this.wsUrl = `ws://${host}:${port}/ws`
   }
 
   protected async start(): Promise<void> {
     // 订阅 recv 事件, 转发为 qq/raw 供 dispatcher 用. (旧代码里叫 startHook, 现在归内部)
     this.addResListener((data: any) => {
       if (data?.type === 'recv' && data.data?.cmd && data.data?.pb) {
-        const payload = Buffer.from(data.data.pb, 'hex')
+        let payload = Buffer.from(data.data.pb, 'hex')
+        // PMHQ 9.x recv pb has a 4-byte big-endian length header (len = header + body).
+        // Parsing it as protobuf shifts fields and the message is silently dropped (#870/#881).
+        // Strip it when it matches; bare protobuf payloads are left untouched.
+        if (payload.length > 4 && payload.readUInt32BE(0) === payload.length) {
+          payload = payload.subarray(4)
+        }
         this.ctx.parallel('qq/raw', { cmd: data.data.cmd, payload })
       }
     })
@@ -127,7 +137,7 @@ export class PmhqQQProtocol extends QQProtocolBase {
       try {
         const resp = await fetch(`${this.httpUrl}health`)
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-        const health = await resp.json() as { uin?: number | null; uid?: string | null }
+        const health = await resp.json() as PMHQHealth
         if (this.pmhqProbeToken !== myToken) return
 
         if (health.uin && health.uid) {
@@ -177,20 +187,32 @@ export class PmhqQQProtocol extends QQProtocolBase {
     return await resp.json()
   }
 
-  // ---- PMHQ 内部: 传输层 (WS / HTTP) ----
-
-  private getPMHQHostPort() {
-    let pmhqPort = '13000'
-    let pmhqHost: string = '127.0.0.1'
-    for (const pArg of process.argv) {
-      if (pArg.startsWith('--pmhq-port=')) {
-        pmhqPort = pArg.replace('--pmhq-port=', '')
-      } else if (pArg.startsWith('--pmhq-host=')) {
-        pmhqHost = pArg.replace('--pmhq-host=', '')
+  /**
+   * QQ 进程资源占用: PMHQ /health 的 memory (字节) + cpu (整机占比小数)。
+   * cpu 是 PMHQ 按相邻两次 /health 的增量算的, 所以第一次调恒为 0, 之后的值覆盖
+   * "上次有人打 /health 到现在" 这段窗口 (WebUI 5s 一轮 -> 就是 5s 均值)。
+   * 老 PMHQ 不返这两个字段 -> null, WebUI 不渲染 "QQ 资源" 卡。
+   */
+  public async getQQResourceUsage(): Promise<QQResourceUsage | null> {
+    try {
+      const resp = await fetch(`${this.httpUrl}health`, { signal: AbortSignal.timeout(3000) })
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      const { memory, cpu, qq_full_version } = (await resp.json()) as PMHQHealth
+      if (!memory || !cpu) return null
+      return {
+        memory: memory.qq_using,
+        totalMemory: memory.total,
+        memoryPercent: memory.total > 0 ? (memory.qq_using / memory.total) * 100 : 0,
+        cpu: Math.min(100, Math.max(0, (cpu.qq_using / (cpu.total || 1)) * 100)),
+        version: qq_full_version || undefined,
       }
+    } catch (e) {
+      this.logger.debug('PMHQ /health 取资源占用失败: %s', (e as Error).message)
+      return null
     }
-    return { pmhqPort, pmhqHost }
   }
+
+  // ---- PMHQ 内部: 传输层 (WS / HTTP) ----
 
   public addResListener<R extends PMHQRes>(listener: ResListener<R>) {
     const listenerId = randomUUID()

@@ -311,6 +311,8 @@ export function parseElements(
             resultId: ext.resultId,
           },
         })
+        // 剔除紧随其后的降级文本段（腾讯服务端为兼容老客户端，在下发 serviceType: 37 大表情时会附带 fallback 纯文本段）
+        // 实测典型案例：/吃糖 会附带 "[吃糖]"，/菜汪 会附带 "[菜汪]"，骰子附带 "[骰子]" 等
         break
       } else if (svcType === 45) {
         const ext = Msg.MarkdownExtra.decode(pbElem)

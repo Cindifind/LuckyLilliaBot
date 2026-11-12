@@ -15,14 +15,17 @@ interface DashboardStats {
     memoryPercent: number
     cpu: number
   }
-  qq: {
+  // 仅 PMHQ 模式有 (来自 PMHQ /health); 直连没有 QQ 进程 -> 后端不返, 这张卡整个不渲染
+  qq?: {
     memory: number
     totalMemory: number
     memoryPercent: number
     cpu: number
+    version?: string
   }
-  // Direct 模式无独立 QQ 进程, 后端返回整机资源, 首张卡显示为 "系统资源"
   mode?: 'direct' | 'pmhq'
+  // 直连模式的协议端 (--protocol); PMHQ 不返
+  protocol?: string
   system?: {
     memory: number
     totalMemory: number
@@ -46,6 +49,16 @@ const GLYPH = 'text-white drop-shadow-[0_1px_1.4px_rgba(0,0,0,0.5)]'
 // Decoupled from the ring: ring hues run down to 2.28:1 under a white glyph, rose holds 3.67:1.
 const CHIP_GRADIENT = 'linear-gradient(135deg, #f43f5e, #ec4899)'
 
+const CHIP = 'shrink-0 whitespace-nowrap text-xs text-theme-muted bg-theme-item px-2 py-0.5 rounded-full'
+
+// 后端只在直连模式下返 protocol; 没登记的端直接显示原值
+const PROTOCOL_LABELS: Record<string, string> = {
+  linux: 'Linux',
+  windows: 'Windows',
+  macos: 'macOS',
+  watch: 'Watch',
+}
+
 // Rings encode the metric, not the card, so every resource card draws CPU and memory the same way.
 const CPU_RING: [string, string] = ['#ec4899', '#f43f5e']
 const MEM_RING: [string, string] = ['#f43f5e', '#fb7185']
@@ -68,6 +81,14 @@ const generateMockStats = (): DashboardStats => ({
     totalMemory: 16 * 1024 * 1024 * 1024,
     memoryPercent: 5 + Math.random() * 8,
     cpu: 5 + Math.random() * 15,
+    version: '9.9.19-34566',
+  },
+  system: {
+    memory: (6 + Math.random() * 3) * 1024 * 1024 * 1024,
+    totalMemory: 16 * 1024 * 1024 * 1024,
+    memoryPercent: 38 + Math.random() * 20,
+    cpu: 10 + Math.random() * 25,
+    label: '16 核',
   },
 })
 
@@ -103,7 +124,7 @@ const StatItem: React.FC<{
   value: string | number
   gradient: string
 }> = ({ icon, label, value, gradient }) => (
-  <div className="flex items-center gap-3 p-3 rounded-xl bg-theme-item hover:bg-theme-item-hover transition-all duration-200 hover:scale-[1.02]">
+  <div className="flex items-center gap-3 p-3 r-control bg-theme-item hover:bg-theme-item-hover transition-colors duration-200">
     <div className={`w-10 h-10 rounded-xl ${gradient} flex items-center justify-center shadow-md`}>
       {icon}
     </div>
@@ -172,6 +193,7 @@ const PieChart: React.FC<{
 const ResourceCard: React.FC<{
   title: string
   version?: string
+  badge?: string
   icon: React.ReactNode
   gradient: string
   cpu: number
@@ -182,7 +204,7 @@ const ResourceCard: React.FC<{
   memGradientId: string
   cpuColors: [string, string]
   memColors: [string, string]
-}> = ({ title, version, icon, gradient, cpu, memory, totalMemory, memoryPercent, cpuGradientId, memGradientId, cpuColors, memColors }) => {
+}> = ({ title, version, badge, icon, gradient, cpu, memory, totalMemory, memoryPercent, cpuGradientId, memGradientId, cpuColors, memColors }) => {
   return (
     <div className="card p-4">
       <div className="flex items-center gap-2 mb-4">
@@ -190,10 +212,11 @@ const ResourceCard: React.FC<{
           {icon}
         </div>
         <h4 className="text-sm font-semibold text-theme">{title}</h4>
-        {version && (
-          <span className="ml-auto text-xs text-theme-muted bg-theme-item px-2 py-0.5 rounded-full">
-            {version}
-          </span>
+        {(version || badge) && (
+          <div className="ml-auto flex items-center gap-1.5">
+            {version && <span className={CHIP}>{version}</span>}
+            {badge && <span className={CHIP}>{badge}</span>}
+          </div>
         )}
       </div>
       <div className="flex justify-around">
@@ -269,6 +292,10 @@ const Dashboard: React.FC<DashboardProps> = ({ llbotVersion, qqVersion }) => {
     )
   }
 
+  const protocolLabel = stats.protocol ? PROTOCOL_LABELS[stats.protocol] ?? stats.protocol : undefined
+  // 直连没有 QQ 卡 -> 只剩两张, 保持两列不留空位
+  const resourceCardCount = 1 + (stats.qq ? 1 : 0) + (stats.system ? 1 : 0)
+
   return (
     <div className="space-y-5">
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -284,7 +311,7 @@ const Dashboard: React.FC<DashboardProps> = ({ llbotVersion, qqVersion }) => {
             </div>
           </div>
           <div className="flex-1 flex flex-col justify-center space-y-2">
-            <div className="p-3 rounded-xl bg-theme-item">
+            <div className="p-3 r-control bg-theme-item">
               <p className="text-xs text-theme-muted">已运行</p>
               <p className="text-xl font-bold bg-gradient-to-r from-pink-500 to-rose-500 bg-clip-text text-transparent">
                 {uptime}
@@ -328,26 +355,11 @@ const Dashboard: React.FC<DashboardProps> = ({ llbotVersion, qqVersion }) => {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {stats.mode === 'direct' && stats.system ? (
-          <ResourceCard
-            title="系统资源"
-            version={stats.system.label}
-            icon={<Server size={16} className={GLYPH} />}
-            gradient="bg-gradient-to-br from-[#14b8a6] to-[#10b981]"
-            cpu={stats.system.cpu}
-            memory={stats.system.memory}
-            totalMemory={stats.system.totalMemory}
-            memoryPercent={stats.system.memoryPercent}
-            cpuGradientId="qqCpuGradient"
-            memGradientId="qqMemGradient"
-            cpuColors={CPU_RING}
-            memColors={MEM_RING}
-          />
-        ) : (
+      <div className={`grid grid-cols-1 md:grid-cols-2 gap-4 ${resourceCardCount >= 3 ? 'lg:grid-cols-3' : ''}`}>
+        {stats.qq && (
           <ResourceCard
             title="QQ 资源"
-            version={qqVersion}
+            version={stats.qq.version || qqVersion}
             icon={<MessageCircle size={16} className={GLYPH} />}
             gradient="bg-gradient-to-br from-[#14b8a6] to-[#10b981]"
             cpu={stats.qq.cpu}
@@ -363,6 +375,7 @@ const Dashboard: React.FC<DashboardProps> = ({ llbotVersion, qqVersion }) => {
         <ResourceCard
           title="LLBot 资源"
           version={llbotVersion}
+          badge={protocolLabel}
           icon={<Bot size={16} className={GLYPH} />}
           gradient="bg-gradient-to-br from-[#ec4899] to-[#f43f5e]"
           cpu={stats.bot.cpu}
@@ -374,6 +387,22 @@ const Dashboard: React.FC<DashboardProps> = ({ llbotVersion, qqVersion }) => {
           cpuColors={CPU_RING}
           memColors={MEM_RING}
         />
+        {stats.system && (
+          <ResourceCard
+            title="系统资源"
+            version={stats.system.label}
+            icon={<Server size={16} className={GLYPH} />}
+            gradient="bg-gradient-to-br from-[#8b5cf6] to-[#6366f1]"
+            cpu={stats.system.cpu}
+            memory={stats.system.memory}
+            totalMemory={stats.system.totalMemory}
+            memoryPercent={stats.system.memoryPercent}
+            cpuGradientId="sysCpuGradient"
+            memGradientId="sysMemGradient"
+            cpuColors={CPU_RING}
+            memColors={MEM_RING}
+          />
+        )}
       </div>
     </div>
   )

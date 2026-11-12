@@ -1,4 +1,5 @@
 import { getLogger } from '@/common/logger'
+import { Cmd } from './cmd'
 import { DirectProtocolClient } from './client'
 
 const logger = getLogger('login')
@@ -8,6 +9,7 @@ import { teaEncrypt, teaDecrypt } from './tea'
 import { AppInfo, DeviceInfo } from './appInfo'
 import { getActiveProfile } from './profiles'
 import { buildWatchFetchFrame, buildWatchPollFrame, buildWatchLoginFrame } from './watch/request'
+import { recordKey } from './packetDump'
 
 export enum QrCodeState {
   Confirmed = 0,
@@ -132,7 +134,7 @@ function buildCode2dPacket(subCommand: number, tlv: Buffer): Buffer {
 export async function fetchQrCode(client: DirectProtocolClient): Promise<QrCodeResult> {
   // watch: 独立的 21-TLV/P-256 拉码帧, 且 trans_emp 不签名 (skipSign)
   if (getActiveProfile().family === 'watch') {
-    const resp = await client.sendCommand('wtlogin.trans_emp', buildWatchFetchFrame(client), EncryptType.EncryptEmpty, 10000, true)
+    const resp = await client.sendCommand(Cmd.Login.ScanCode, buildWatchFetchFrame(client), EncryptType.EncryptEmpty, 10000, true)
     return parseTransEmp31Response(resp.payload, client.getEcdhShareKey())
   }
 
@@ -181,7 +183,7 @@ export async function fetchQrCode(client: DirectProtocolClient): Promise<QrCodeR
   const wtLogin = buildWtLoginFrame(0, 'wtlogin.trans_emp', code2d, client.getEcdhPublicKey(), client.getEcdhShareKey())
 
   const resp = await client.sendCommand(
-    'wtlogin.trans_emp',
+    Cmd.Login.ScanCode,
     wtLogin,
     EncryptType.EncryptEmpty,
     10000,
@@ -192,7 +194,7 @@ export async function fetchQrCode(client: DirectProtocolClient): Promise<QrCodeR
 
 export async function pollQrCode(client: DirectProtocolClient, sig: Buffer): Promise<QrPollResult> {
   if (getActiveProfile().family === 'watch') {
-    const resp = await client.sendCommand('wtlogin.trans_emp', buildWatchPollFrame(client, sig), EncryptType.EncryptEmpty, 10000, true)
+    const resp = await client.sendCommand(Cmd.Login.ScanCode, buildWatchPollFrame(client, sig), EncryptType.EncryptEmpty, 10000, true)
     return parseTransEmp12Response(resp.payload, client.getEcdhShareKey())
   }
 
@@ -211,7 +213,7 @@ export async function pollQrCode(client: DirectProtocolClient, sig: Buffer): Pro
   const wtLogin = buildWtLoginFrame(0, 'wtlogin.trans_emp', code2d, client.getEcdhPublicKey(), client.getEcdhShareKey())
 
   const resp = await client.sendCommand(
-    'wtlogin.trans_emp',
+    Cmd.Login.ScanCode,
     wtLogin,
     EncryptType.EncryptEmpty,
     10000,
@@ -230,6 +232,9 @@ export async function loginWithQrResult(
     throw new Error('QR poll result incomplete')
   }
 
+  recordKey('tgtgtKey', qrResult.tgtgtKey, 'TLV 0x1E of the confirmed poll; TEA key of TLV 0x144 / 0x119')
+  recordKey('tempPassword', qrResult.tempPassword, 'TLV 0x18 (A1), sent as TLV 0x106')
+
   // watch: 独立 21-TLV/P-256 登录帧; login 仍走 SIGN_ALLOWLIST (FEKit 签名, 后端未就绪会 503)
   if (getActiveProfile().family === 'watch') {
     const frame = buildWatchLoginFrame(client, {
@@ -238,7 +243,7 @@ export async function loginWithQrResult(
       tempPassword: qrResult.tempPassword,
       noPicSig: qrResult.noPicSig,
     })
-    const resp = await client.sendCommand('wtlogin.login', frame, EncryptType.EncryptEmpty, 15000)
+    const resp = await client.sendCommand(Cmd.Login.Login, frame, EncryptType.EncryptEmpty, 15000)
     const result = parseLoginResponse(resp.payload, client.getEcdhShareKey(), qrResult.tgtgtKey)
     if (result.success) {
       client.setSession({
@@ -311,7 +316,7 @@ export async function loginWithQrResult(
   const wtLogin = buildWtLoginFrame(uin, 'wtlogin.login', loginBody, client.getEcdhPublicKey(), client.getEcdhShareKey())
 
   const resp = await client.sendCommand(
-    'wtlogin.login',
+    Cmd.Login.Login,
     wtLogin,
     EncryptType.EncryptEmpty,
     15000,
@@ -629,25 +634,27 @@ function parseLoginResponse(data: Buffer, shareKey: Buffer, tgtgtKey: Buffer): L
 
   const decrypted119 = Buffer.from(teaDecrypt(tlv119, tgtgtKey))
   const nestedTlvs = tlvUnpack(decrypted119)
+  recordKey('tlv0x119.plain', decrypted119, 'decrypted TLV 0x119 body, holds d2/d2Key/tgt')
 
   const d2 = nestedTlvs.get(0x143) || Buffer.alloc(0)
   const d2Key = nestedTlvs.get(0x305) || Buffer.alloc(16)
   const tgt = nestedTlvs.get(0x10A) || Buffer.alloc(0)
   const tempPassword = nestedTlvs.get(0x106) || Buffer.alloc(0)
 
-  // A2Key 候选: 探多个 TLV ID, debug log 出来. path D (SsoSecureA2Access) 需要它解 server response.
-  // 常见 A2 相关 TLV (按 QQ NT 协议慣例):
-  //   0x10C: A1 transport (password login), 不是这条路
-  //   0x10D: A2 key on legacy, 现在很少
-  //   0x10E: ST key (signal token key)
-  //   0x10A: TGT (已用)
-  //   0x163, 0x16A, 0x16D: 其他可能
+  // 全量 dump 0x119 内层 TLV, 用来认还没解析的字段。凭据有效期在 0x138。
   {
-    const seenIds = Array.from(nestedTlvs.keys()).sort((a, b) => a - b).map(x => '0x' + x.toString(16))
-    const lines = [`nested TLVs in 0x119: ${seenIds.join(', ')}`]
-    for (const cand of [0x10C, 0x10D, 0x10E, 0x163, 0x16A, 0x16D, 0x172, 0x16E]) {
-      const v = nestedTlvs.get(cand)
-      if (v) lines.push(`  TLV 0x${cand.toString(16)}: ${v.length}B = ${v.subarray(0, Math.min(32, v.length)).toString('hex')}${v.length > 32 ? '...' : ''}`)
+    // 凭据本体不进日志 (D2 / TGT / d2Key / A1), 只报长度。
+    const SECRETS = new Set([0x106, 0x10A, 0x143, 0x305])
+    const ids = Array.from(nestedTlvs.keys()).sort((a, b) => a - b)
+    const lines = [`nested TLVs in 0x119: ${ids.map(x => '0x' + x.toString(16)).join(', ')}`]
+    for (const id of ids) {
+      const v = nestedTlvs.get(id)!
+      const tag = `  TLV 0x${id.toString(16)}: ${v.length}B`
+      if (SECRETS.has(id)) { lines.push(`${tag} = <redacted>`); continue }
+      const hex = v.subarray(0, Math.min(128, v.length)).toString('hex')
+      // 可打印 ASCII 的一并给出明文, 省得再手工解一遍
+      const ascii = v.every(b => b >= 0x20 && b < 0x7f) ? ` "${v.toString('latin1')}"` : ''
+      lines.push(`${tag} = ${hex}${v.length > 128 ? '...' : ''}${ascii}`)
     }
     logger.debug(lines.join('\n'))
   }

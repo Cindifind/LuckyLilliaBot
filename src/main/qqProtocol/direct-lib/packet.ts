@@ -4,6 +4,7 @@ import { getActiveProfile } from './profiles'
 import type { SignResult } from './sign'
 import { randomBytes } from 'node:crypto'
 import { inflateSync } from 'node:zlib'
+import { dumpSsoIn, dumpSsoOut, dumpFullFrame } from './packetDump'
 
 export enum EncryptType {
   NoEncrypt = 0x00,
@@ -83,7 +84,7 @@ function buildSsoHead12(seq: number, cmd: string, ctx: PacketContext, signResult
 
   parts.push(writeInt16PrefixedString(profile.ssoHeadVersion ?? ctx.buildVer))
 
-  const reservedField = buildReservedFieldForVariant(profile.reserveVariant, ctx.uid || undefined, signResult, { guidHex })
+  const reservedField = buildReservedFieldForVariant(profile.reserveVariant, ctx.uid || undefined, signResult, { guidHex, cmd })
   parts.push(writeInt32Prefixed(reservedField))
 
   const head = Buffer.concat(parts)
@@ -96,7 +97,7 @@ function buildSsoHead13(cmd: string, ctx: PacketContext): Buffer {
   const parts: Buffer[] = []
   parts.push(writeInt32PrefixedString(cmd))
   parts.push(writeInt32Prefixed(Buffer.alloc(0)))
-  const reservedField = buildReservedFieldForVariant(profile.reserveVariant, ctx.uid || undefined, null, { guidHex: ctx.guid.toString('hex') })
+  const reservedField = buildReservedFieldForVariant(profile.reserveVariant, ctx.uid || undefined, null, { guidHex: ctx.guid.toString('hex'), cmd })
   parts.push(writeInt32Prefixed(reservedField))
   const head = Buffer.concat(parts)
   return writeInt32Prefixed(head)
@@ -115,6 +116,7 @@ export function buildServicePacket13(
   payload: Buffer,
   encryptType: EncryptType = EncryptType.NoEncrypt,
 ): Buffer {
+  dumpSsoOut({ seq, cmd, body: payload, encType: encryptType, d2Key: ctx.d2Key, protoVer: 13 })
   const ssoFrame = buildSsoFrame13(cmd, ctx, payload)
 
   let encrypted: Buffer
@@ -172,7 +174,14 @@ export function buildServicePacket(
   encryptType: EncryptType = EncryptType.EncryptD2Key,
   signResult?: SignResult | null,
 ): Buffer {
+  dumpSsoOut({
+    seq, cmd, body: payload, encType: encryptType, d2Key: ctx.d2Key,
+    protoVer: getActiveProfile().ssoProtocolVersion,
+  })
   const ssoFrame = buildSsoFrame12(seq, cmd, ctx, payload, signResult)
+  // [SA 1001 调查] 抓 o3 命令完整未加密帧 (head+reserve+SecInfo+body), 跟真机逐字节 diff。
+  // TEMP(2026-10-05 诊断): 临时 dump 所有命令全帧, 做真机 vs Bot 网络帧逐字节对比; 验证后改回只 o3。
+  dumpFullFrame(cmd, ssoFrame)
 
   let encrypted: Buffer
   switch (encryptType) {
@@ -250,7 +259,14 @@ export function parseServicePacket(frame: Buffer, d2Key: Buffer): SsoPacket | nu
   }
 
   // Response always uses Protocol 12 format with full head
-  return parseSsoFrame12(ssoBody)
+  const parsed = parseSsoFrame12(ssoBody)
+  if (parsed) {
+    dumpSsoIn({
+      seq: parsed.seq, cmd: parsed.cmd, body: parsed.payload, encType: encType, d2Key,
+      protoVer: version, retCode: parsed.retCode, extraMsg: parsed.extraMsg,
+    })
+  }
+  return parsed
 }
 
 function parseSsoFrame13(data: Buffer, seq: number): SsoPacket | null {

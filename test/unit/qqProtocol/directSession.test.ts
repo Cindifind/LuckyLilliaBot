@@ -59,6 +59,12 @@ vi.mock('@/main/qqProtocol/direct-lib/sign', () => ({
   setSignMachineGuid: vi.fn(),
   acquireSignToken: vi.fn(async () => ({ token: 'test-token', ttlSecs: 3600 })),
   updateAuthToken: vi.fn(),
+  startLinuxSsoReport: vi.fn(async () => {}),
+  stopLinuxSsoReport: vi.fn(),
+  // 返 null = 真实实现里"没 inited / 老 .node"的跳过分支, 不触发 xwid 突发。
+  buildLinuxXwidBody: vi.fn(() => null),
+  signLinuxXwidBurst: vi.fn(async () => null),
+  acquireMacosEskOnly: vi.fn(),
 }))
 
 vi.mock('@/main/qqProtocol/direct-lib/login', () => ({
@@ -579,6 +585,28 @@ describe('reconnect and QR refresh after dropping offline', () => {
     vi.restoreAllMocks()
   })
 
+  it('keeps the device fingerprint when another login kicks this one', async () => {
+    protocol['runtimeUinOverride'] = '123456'
+    const stopHeartbeat = vi.fn()
+    protocol['directStopHeartbeat'] = stopHeartbeat
+    client.setSession(createSession())
+    await protocol['start']()
+
+    await protocol['ctx'].parallel('nt/kicked-offline', {
+      tipsTitle: 'Offline',
+      tipsDesc: 'logged in elsewhere',
+      kickedType: 1001,
+    })
+
+    // 顶号只丢凭据: 删 session 退回扫码, 但保留 machine_guid -- 换设备指纹会在服务端堆出一台
+    // 新设备 (可能触发设备验证), 还会让同 data 目录里其他账号的 session 跟 guid 失配.
+    expect(deleteSession).toHaveBeenCalledExactlyOnceWith('123456')
+    expect(deleteMachineGuid).not.toHaveBeenCalled()
+    expect(protocol['runtimeUinOverride']).toBeNull()
+    expect(client.getSession()).toBeNull()
+    expect(stopHeartbeat).toHaveBeenCalledTimes(1)
+  })
+
   it('stops reconnecting once init has fallen back to QR', async () => {
     const init = vi
       .spyOn(protocol as unknown as { initDirectClient(): Promise<void> }, 'initDirectClient')
@@ -745,6 +773,20 @@ describe('reconnect and QR refresh after dropping offline', () => {
     await expect(protocol.getLoginQrCode()).resolves.toMatchObject({ qrcodeUrl: 'qr' })
     expect(fetch).toHaveBeenCalledTimes(7)
     expect(protocol['qrFetchRetryAt']).toBe(0)
+  })
+
+  it('keeps the loop silent while there is no code to show', async () => {
+    const fetch = vi
+      .spyOn(protocol as unknown as { fetchFreshQrCode(): Promise<unknown> }, 'fetchFreshQrCode')
+      .mockResolvedValue(null)
+    const warn = vi.spyOn(protocol['logger'], 'warn')
+
+    await protocol['qrLoop']()
+    await vi.advanceTimersByTimeAsync(3_000)
+
+    // client 未就绪不算拉码失败: 不退避, 每秒照旧重试, 但一条日志不打
+    expect(fetch).toHaveBeenCalledTimes(4)
+    expect(warn).not.toHaveBeenCalled()
   })
 
   it('logs how long a QR code lived when the server expires it', async () => {
