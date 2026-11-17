@@ -81,7 +81,7 @@ describe('npm directory catalog', () => {
     await expect(fixture(entries).catalog.load()).rejects.toThrow('精确版本号')
   })
 
-  it.each(['protocol', 'adapter', 'chat', 'tool', 'service', 'other'])('preserves the registration category supported by the Bot: %s', async category => {
+  it.each(['protocol', 'adapter', 'chat', 'tool', 'service', 'theme', 'other'])('preserves the registration category supported by the Bot: %s', async category => {
     const entry = { ...plugin, category }
     expect([...await fixture(files([entry])).catalog.load()]).toEqual([[plugin.name, entry]])
   })

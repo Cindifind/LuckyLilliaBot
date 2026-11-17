@@ -86,6 +86,37 @@ afterEach(async () => {
 })
 
 describe('PluginService', () => {
+  it.each([false, true])('removes missing package entries and preserves configuration only when requested (%s)', async keepConfig => {
+    const name = '@luckylillia/plugin-onebot11'
+    const entries = [
+      { id: 'missing-a', name, config: { token: 'test-secret', port: 3000 }, scope: { platforms: ['ntqq'] } },
+      { id: 'missing-b', name, disabled: true, config: { port: 3001 } },
+    ]
+    writeFileSync(file, JSON.stringify({ version: 1, entries, trusted: [name], messageOrder: ['missing-a'],
+      ui: { hidden: [`${name}|page|settings`], order: { [`${name}|page|settings`]: 2 } } }))
+    const plugins = await boot()
+    expect(plugins.get('missing-a').state).toBe('missing')
+    expect(await plugins.removePackage(name, { keepConfig, missingOnly: true })).toEqual(['missing-a', 'missing-b'])
+    expect(plugins.list().some(entry => entry.name === name)).toBe(false)
+    const stored = JSON.parse(readFileSync(file, 'utf8'))
+    expect(stored.retained).toEqual(keepConfig ? entries.map(entry => ({ ...entry, disabled: true })) : undefined)
+    expect(stored.trusted).not.toContain(name)
+    expect(stored.messageOrder).toEqual([])
+    expect(stored.ui).toEqual({ hidden: [], order: {} })
+    expect(byName('alpha')).toMatchObject({ state: 'disposed', disabled: true })
+    await service!.dispose()
+    await boot()
+    expect(ctx.plugins.list().some(entry => entry.name === name)).toBe(false)
+  })
+
+  it('refuses missing-package cleanup after a package is available again', async () => {
+    const plugins = await boot()
+    const original = readFileSync(file, 'utf8')
+    await expect(plugins.removePackage('alpha', { missingOnly: true })).rejects.toThrow('插件文件已恢复')
+    expect(byName('alpha').state).toBe('disposed')
+    expect(readFileSync(file, 'utf8')).toBe(original)
+  })
+
   it('lists new packages as disabled entries and persists them', async () => {
     const plugins = await boot()
     expect(byName('alpha')).toMatchObject({ disabled: true, state: 'disposed', version: '1.0.0' })
@@ -428,6 +459,14 @@ const builtins: BuiltinPlugin[] = [
 const adapterEvents = () => globalThis.__pluginTest.filter(event => event.startsWith('adapter:'))
 
 describe('PluginService builtins', () => {
+  it('forbids using missing-package cleanup to remove core or builtin entries', async () => {
+    const plugins = await boot(builtins)
+    for (const builtin of builtins) {
+      expect(() => plugins.removePackage(builtin.name, { missingOnly: true })).toThrow(PluginForbiddenError)
+      expect(byName(builtin.name)).toBeDefined()
+    }
+  })
+
   it('lists builtins as enabled entries that start once their dependencies are up', async () => {
     await boot(builtins)
     expect(byName('builtin:adapter')).toMatchObject({

@@ -23,7 +23,8 @@ export async function withLocalUpload<T>(request: Request, root: string, install
     throw new ArchiveError('请使用表单上传插件压缩包')
   }
   await mkdir(root, { recursive: true })
-  const temporary = await mkdtemp(path.join(root, '.market-upload-'))
+  // Uploads happen before acquiring the install lock; another instance's cleanup must leave them alone.
+  const temporary = await mkdtemp(path.join(root, '.llbot-upload-'))
   const archive = path.join(temporary, 'archive')
   let filename: string | undefined
   let confirmed = false

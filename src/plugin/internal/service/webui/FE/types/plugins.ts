@@ -27,6 +27,8 @@ export interface PluginStatus {
   name: string
   version?: string
   packageName?: string
+  /** The scanned entry to remove; links are removed without touching the original source directory. */
+  removal?: { path: string; kind: 'directory' | 'link' }
   description?: string
   manifest: PluginManifest
   disabled: boolean

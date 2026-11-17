@@ -1,11 +1,23 @@
 import React, { useEffect, useMemo, useSyncExternalStore } from 'react'
-import { type PluginCatalogProps, type PluginCatalogState, type WebUIPlugin } from '@luckylillia/plugin-sdk/webui'
+import { usePlugins, type PluginCatalogProps, type PluginCatalogState, type WebUIContext, type WebUIPlugin } from '@luckylillia/plugin-sdk/webui'
 import LocalInstallPanel from './LocalInstallPanel'
 import { MarketStore } from './store'
 
 export const name = 'builtin:market'
 
-interface InstallOutcome {
+interface InstanceResult {
+  instance: string
+  pid: number
+  status: 'reloaded' | 'unchanged' | 'removed' | 'restart-required' | 'failed'
+  reason?: string
+}
+
+interface PackageResult {
+  reload?: { status: 'reloaded' } | { status: 'restart-required' | 'failed'; reason: string }
+  instances?: InstanceResult[]
+}
+
+interface InstallOutcome extends PackageResult {
   name: string
   title?: string
   version: string
@@ -13,8 +25,7 @@ interface InstallOutcome {
   entries: string[]
   scripts: string[]
   skipped: string[]
-  reload?: { status: 'reloaded' } | { status: 'restart-required' | 'failed'; reason: string }
-  dependencies?: { name: string; title?: string; version: string; previous?: string; entries: string[]; reload?: InstallOutcome['reload'] }[]
+  dependencies?: (PackageResult & { name: string; title?: string; version: string; previous?: string; entries: string[] })[]
 }
 
 // Local uploads do not reveal their package name until the server validates them.
@@ -23,6 +34,24 @@ const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e))
 const store = new MarketStore()
 const titleOf = (name: string, title?: string) => title || store.installed?.find(pkg => pkg.name === name)?.title
   || store.catalog?.find(item => item.name === name)?.title || name
+
+function reportResult(ctx: WebUIContext, message: string, result: PackageResult, announceSuccess = true) {
+  if (result.instances?.length) {
+    const failures = result.instances.filter(item => item.status === 'failed')
+    const pending = result.instances.filter(item => item.status === 'restart-required')
+    const details = [
+      ...failures.map(item => `实例 ${item.instance} 同步失败${item.reason ? `：${item.reason}` : ''}`),
+      ...pending.map(item => `实例 ${item.instance} 需要重启 Bot${item.reason ? `：${item.reason}` : ''}`),
+    ]
+    if (details.length) ctx.toast(`${message}；${details.join('；')}`, failures.length ? 'error' : 'warning')
+    else if (announceSuccess) ctx.toast(`${message}${result.instances.length > 1 ? `；已同步 ${result.instances.length} 个实例` : ''}`)
+    return
+  }
+  const reload = result.reload
+  if (reload?.status === 'restart-required') ctx.toast(`${message}，重启 Bot 后生效：${reload.reason}`, 'warning')
+  else if (reload?.status === 'failed') ctx.toast(`${message}，但重新加载失败：${reload.reason}`, 'error')
+  else if (announceSuccess) ctx.toast(message)
+}
 
 function useMarket() {
   useSyncExternalStore(store.subscribe, () => store.version)
@@ -68,13 +97,9 @@ async function performInstall(key: string, label: string, request: () => Promise
       what += `；同时安装或更新了依赖插件：${outcome.dependencies.map(dep => `${titleOf(dep.name, dep.title)} ${dep.version}`).join('、')}`
     }
     if (!outcome.previous || outcome.dependencies?.some(dep => !dep.previous)) what += '；新装插件可在「已安装」中启用'
-    const reload = outcome.reload
-    if (reload?.status === 'restart-required') ctx.toast(`${what}，重启 Bot 后生效：${reload.reason}`, 'warning')
-    else if (reload?.status === 'failed') ctx.toast(`${what}，但重新加载失败，还在跑旧版本：${reload.reason}`, 'error')
-    else ctx.toast(what)
+    reportResult(ctx, what, outcome)
     for (const dep of outcome.dependencies ?? []) {
-      if (dep.reload?.status === 'restart-required') ctx.toast(`依赖插件 ${titleOf(dep.name, dep.title)} 需要重启 Bot 后生效：${dep.reload.reason}`, 'warning')
-      else if (dep.reload?.status === 'failed') ctx.toast(`依赖插件 ${titleOf(dep.name, dep.title)} 重新加载失败，还在跑旧版本：${dep.reload.reason}`, 'error')
+      reportResult(ctx, `依赖插件 ${titleOf(dep.name, dep.title)}`, dep, false)
     }
     if (outcome.scripts.length) {
       ctx.toast(`这些包带安装脚本，没有运行：${outcome.scripts.join('、')}。需要编译的原生模块会加载失败`, 'warning')
@@ -103,8 +128,8 @@ async function uninstall(name: string, options: { keepConfig?: boolean } = {}): 
   store.invalidateUpdates()
   store.emit()
   try {
-    await ctx.api('/api/market/uninstall', { body: { name, keepConfig: options.keepConfig === true } })
-    ctx.toast(`已卸载 ${titleOf(name)}`)
+    const outcome = await ctx.api<{ instances?: InstanceResult[] }>('/api/market/uninstall', { body: { name, keepConfig: options.keepConfig === true } })
+    reportResult(ctx, `已卸载 ${titleOf(name)}`, outcome)
     return true
   } catch (e) {
     ctx.toast(`卸载 ${titleOf(name)} 失败：${errorText(e)}`, 'error')
@@ -124,9 +149,21 @@ async function uninstall(name: string, options: { keepConfig?: boolean } = {}): 
 /** Supplies package metadata and operations; the host owns filtering, cards, details and settings. */
 const CatalogBridge: React.FC<PluginCatalogProps> = ({ loadCatalog, onChange }) => {
   const market = useMarket()
+  const plugins = usePlugins()
   useEffect(() => {
     if (loadCatalog) void market.loadCatalog()
   }, [loadCatalog, market, market.ctx])
+
+  useEffect(() => {
+    if (!plugins) return
+    const ctx = market.ctx
+    // Peer updates arrive on the host's plugin stream; refresh package versions after the status burst settles.
+    const timer = setTimeout(async () => {
+      if (!ctx || market.ctx !== ctx || market.busy.size) return
+      if (await market.loadInstalled() && market.ctx === ctx) await market.checkUpdates(false)
+    }, 300)
+    return () => clearTimeout(timer)
+  }, [plugins, market, market.ctx])
 
   const snapshot = useMemo<PluginCatalogState>(() => {
     const refresh = () => {

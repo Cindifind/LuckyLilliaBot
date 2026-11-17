@@ -249,7 +249,7 @@ describe('normalizeCategory', () => {
     expect(normalizeCategory('games', warnings)).toBeUndefined()
     expect(normalizeCategory(1, warnings)).toBeUndefined()
     expect(warnings).toHaveLength(2)
-    expect(warnings[0]).toContain('protocol / adapter / chat / tool / service / other')
+    expect(warnings[0]).toContain('protocol / adapter / chat / tool / service / theme / other')
 
     pkg('categorized', { name: 'categorized', type: 'module', llbot: { category: 'chat' } })
     pkg('miscategorized', { name: 'miscategorized', type: 'module', llbot: { category: 'Chat' } })

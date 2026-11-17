@@ -4,11 +4,12 @@ import path from 'node:path'
 import { satisfies } from 'compare-versions'
 import { satisfies as satisfiesRange, validRange } from 'semver'
 import type { LLBotManifest, PluginCategory } from '@luckylillia/plugin-sdk'
+import { inspectPackageLocation, type PackageLocation } from './package-location'
 
 export const SDK_PACKAGE = '@luckylillia/plugin-sdk'
 
 /** The values of `llbot.category`, in the order the plugin page lists them. */
-export const PLUGIN_CATEGORIES: readonly PluginCategory[] = ['protocol', 'adapter', 'chat', 'tool', 'service', 'other']
+export const PLUGIN_CATEGORIES: readonly PluginCategory[] = ['protocol', 'adapter', 'chat', 'tool', 'service', 'theme', 'other']
 
 /** Extensions of the images a package may show in the WebUI: its icon, screenshots and what its details show. */
 export const IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg']
@@ -33,6 +34,8 @@ export interface PluginPackage {
   version: string
   /** Absolute package directory. */
   root: string
+  /** Original scanned entry; deletion must use this instead of following root into linked source code. */
+  location?: PackageLocation
   /** Absolute entry file. */
   main: string
   manifest: LLBotManifest
@@ -77,7 +80,10 @@ export async function scanPluginRoots(roots: string[]): Promise<ScanResult> {
       for (const candidate of candidates) {
         try {
           const pkg = await readPluginPackage(candidate)
-          if (pkg) result.packages.push(pkg)
+          if (pkg) {
+            pkg.location = await inspectPackageLocation(root, candidate).catch(() => undefined)
+            result.packages.push(pkg)
+          }
         } catch (e) {
           result.errors.push({ path: candidate, error: (e as Error).message })
         }

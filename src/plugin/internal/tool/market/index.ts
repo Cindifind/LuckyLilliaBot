@@ -6,12 +6,13 @@ import { compareVersions } from 'compare-versions'
 import { Context as HonoContext, Hono } from 'hono'
 import type { PluginCategory } from '@luckylillia/plugin-sdk'
 import type { PluginStatus, ReloadResult } from '../../../host'
+import type { SharedPackageResult } from '../../../host/shared-packages'
 import { matchesPluginVersion, parsePluginDependencies, PLUGIN_CATEGORIES, SDK_PACKAGE, sdkIncompatibility } from '../../../host/manifest'
 import { SHARED_SPECIFIERS } from '../../../host/resolve-hook'
 import { Catalog, type CatalogEntry, type CatalogSnapshot } from './catalog'
 import { ArchiveError, readLocalPackage } from './archive'
 import { Installer, type InstallResult, type PackageSource } from './installer'
-import { PackageVersion, type PackageManifest, type Packument, Registry, RegistryError } from './registry'
+import { isExactVersion, isPackageName, pickVersion, PackageVersion, type PackageManifest, type Packument, Registry, RegistryError } from './registry'
 import { MarketSchema, type MarketSettings } from './settings'
 import { withLocalUpload } from './upload'
 import { matchesOrigin, type PluginOrigin } from './origin'
@@ -43,6 +44,8 @@ export interface UpdateInfo {
 }
 
 export interface InstallOutcome extends InstallResult {
+  /** How every live instance sharing the physical package directory applied this change. */
+  instances?: SharedPackageResult[]
   title?: string
   previous?: string
   /** The package's entries; a first install has one, switched off */
@@ -91,6 +94,10 @@ export class Market {
     this.installer = new Installer(registry, root, new Set(SHARED_SPECIFIERS))
   }
 
+  cleanup(): Promise<void> {
+    return this.serial(() => this.installer.cleanup())
+  }
+
   installed(): InstalledPackage[] {
     const titles = new Map(this.ctx.plugins.list().map(entry => [entry.name, entryTitle(entry)]))
     return [...this.ctx.plugins.packageList().map(pkg => ({
@@ -102,7 +109,7 @@ export class Market {
       root: pkg.root,
     })), ...this.ctx.plugins.builtinPackageList().map(pkg => ({
       name: pkg.name, title: titles.get(pkg.entryName), version: pkg.version,
-      managed: !pkg.root || this.manages(pkg.name, pkg.root),
+      managed: this.ctx.plugins.packageRootWritable(this.installer.root) && (!pkg.root || this.manages(pkg.name, pkg.root)),
       root: pkg.root ?? this.installer.target(pkg.name)!,
       builtin: pkg.entryName, activeVersion: pkg.activeVersion, restartRequired: pkg.restartRequired, error: pkg.error,
     }))].sort((a, b) => Number(b.managed) - Number(a.managed) || a.name.localeCompare(b.name))
@@ -232,6 +239,43 @@ export class Market {
     return this.installPlan(plan)
   }
 
+  /** Explicit startup requests use npm directly. Existing packages are never updated by this operation. */
+  ensureRequested(name: string): Promise<{ names: string[]; installed: InstallOutcome[] }> {
+    if (!isPackageName(name)) return Promise.reject(new MarketError('启动插件参数必须是 npm 包名'))
+    if (!this.ctx.plugins.packageRootWritable(this.installer.root)) {
+      const existing = this.installedPackages().find(pkg => pkg.name === name)
+      if (!existing) return Promise.reject(new MarketError(`${name} 未安装，插件目录为只读，无法自动安装`, 409))
+      const main = { name, version: existing.version, dependencies: parsePluginDependencies(existing.manifest.dependencies) }
+      return this.planPlugins(main, undefined, undefined, async dependency => {
+        throw new MarketError(`缺少 ${dependency}，插件目录为只读，无法自动安装`, 409)
+      }).then(plan => ({ names: plan.map(item => item.name), installed: [] }))
+    }
+    return this.serial(async () => {
+      const existing = this.installedPackages().find(pkg => pkg.name === name)
+      let main: PlannedPlugin
+      if (existing) {
+        main = { name, version: existing.version, dependencies: parsePluginDependencies(existing.manifest.dependencies) }
+      } else {
+        this.assertManageable(name)
+        main = this.planned({ manifest: await this.requestedVersion(name, []) }, name)
+      }
+      const plan = await this.planPlugins(main, undefined, undefined, (dependency, ranges) => this.requestedVersion(dependency, ranges))
+      const installed: InstallOutcome[] = []
+      for (const item of plan) if (item.source) installed.push(await this.installPackage(item.source))
+      return { names: plan.map(item => item.name), installed }
+    })
+  }
+
+  private async requestedVersion(name: string, ranges: string[]): Promise<PackageVersion> {
+    const document = await this.registry.packument(name, true)
+    if (document.name !== name) throw new MarketError(`npm 返回的包与请求的 ${name} 不符`)
+    const version = pickVersion(document, ranges[0] ?? 'latest', candidate =>
+      candidate.name === name && isExactVersion(candidate.version) && ranges.every(range => matchesPluginVersion(candidate.version, range))
+      && !this.incompatibility(candidate))
+    if (!version) throw new MarketError(`${name} 没有满足当前 Bot 和插件依赖要求的 npm 版本`, 409)
+    return version
+  }
+
   /** Local uploads need no catalog approval; missing plugin dependencies still come from its pinned versions. */
   installLocal(archive: string, filename: string): Promise<InstallOutcome> {
     return this.serial(async () => {
@@ -303,6 +347,7 @@ export class Market {
     main: PlannedPlugin,
     catalog?: CatalogSnapshot,
     packument = (name: string) => this.registry.packument(name, true),
+    requestedVersion?: (name: string, ranges: string[]) => Promise<PackageVersion>,
   ): Promise<PlannedPlugin[]> {
     const installed = new Map(this.installedPackages().map(pkg => [pkg.name, pkg]))
     const installedRequirements = new Map<string, PluginRequirement[]>()
@@ -342,6 +387,11 @@ export class Market {
         return resolve([...rest, ...requirementsOf(item)], next)
       }
       this.assertManageable(name)
+      if (requestedVersion) {
+        const candidate = await requestedVersion(name, ranges)
+        const item = this.planned({ manifest: candidate }, name)
+        return resolve([...rest, ...requirementsOf(item)], new Map(selected).set(name, item))
+      }
       // A self-contained local package also installs while the market catalog is unavailable.
       catalog ??= await this.catalog.load()
       const entry = this.assertListed(catalog, name)
@@ -390,44 +440,53 @@ export class Market {
     const { name } = chosen
     const builtin = this.builtin(name)
     const previous = this.installedPackages().find(pkg => pkg.name === name)?.version
-    const result = await this.installer.install(source)
+    let instances: SharedPackageResult[] = []
+    const result = await this.installer.install(source, async replace => {
+      const outcome = await this.ctx.plugins.changePackage({ root: this.installer.root, name, kind: 'install',
+        manifest: chosen, builtin: !!builtin }, async () => {
+        await replace()
+        if (builtin) await this.ctx.plugins.approveBuiltinPackage(name, chosen.version)
+      })
+      instances = outcome.instances
+    })
     if (builtin) {
-      await this.ctx.plugins.approveBuiltinPackage(name, chosen.version)
       this.ctx.logger('market').info(`updated builtin ${name}@${chosen.version}; restart required`)
       const entries = this.ctx.plugins.list().filter(entry => entry.name === builtin.entryName)
       return {
-        ...result, previous, title: entryTitle(entries[0]),
+        ...result, previous, instances, title: entryTitle(entries[0]),
         entries: entries.map(entry => entry.id),
         reload: { status: 'restart-required', reason: '内置插件更新将在重启 Bot 后生效' },
       }
     }
     this.ctx.logger('market').info(`installed ${name}@${chosen.version}${previous ? ` (was ${previous})` : ''}`)
-    await this.ctx.plugins.scan()
     const entries = this.ctx.plugins.list().filter(status => status.name === name)
-    const outcome: InstallOutcome = { ...result, previous, title: entryTitle(entries[0]), entries: entries.map(entry => entry.id) }
-    const running = entries.find(entry => !entry.disabled)
-    if (previous && running) {
-      outcome.reload = await this.ctx.plugins.reload(running.id).catch(e => ({ status: 'failed' as const, reason: (e as Error).message }))
-    }
+    const outcome: InstallOutcome = { ...result, previous, instances, title: entryTitle(entries[0]), entries: entries.map(entry => entry.id) }
+    const failed = instances.filter(item => item.status === 'failed')
+    if (failed.length) outcome.reload = { status: 'failed', reason: failed.map(item => `${item.instance}: ${item.reason}`).join('; ') }
+    else if (instances.some(item => item.status === 'reloaded')) outcome.reload = { status: 'reloaded' }
     return outcome
   }
 
   /** Removes the package and trust; entry configurations can be retained for a later installation. */
-  uninstall(name: string, options: { keepConfig?: boolean } = {}): Promise<{ removed: string[] }> {
+  uninstall(name: string, options: { keepConfig?: boolean } = {}): Promise<{ removed: string[]; instances: SharedPackageResult[] }> {
     return this.serial(async () => {
       if (this.builtin(name)) throw new MarketError('内置插件不能卸载', 409)
       this.assertManageable(name)
       if (!this.ctx.plugins.packageList().some(pkg => pkg.name === name)) throw new MarketError(`${name} is not installed`, 404)
-      await this.installer.uninstall(name)
-      const removed = await this.ctx.plugins.removePackage(name, options)
-      await this.ctx.plugins.scan()
+      const removed = this.ctx.plugins.list().filter(entry => entry.name === name).map(entry => entry.id)
+      const { instances } = await this.ctx.plugins.changePackage({ root: this.installer.root, name, kind: 'uninstall',
+        keepConfig: options.keepConfig }, () => this.installer.uninstall(name))
       this.ctx.logger('market').info(`uninstalled ${name}`)
-      return { removed }
+      return { removed, instances }
     })
   }
 
   private serial<T>(task: () => Promise<T>): Promise<T> {
-    const result = this.queue.then(task)
+    const result = this.queue.then(() => this.ctx.plugins.withPackageMutation(this.installer.root, async () => {
+      // A queued request may have been superseded by another instance. Recheck against disk under the lock.
+      await this.ctx.plugins.scan()
+      return task()
+    }))
     this.queue = result.catch(() => {})
     return result
   }
@@ -444,7 +503,7 @@ export class Market {
 
   private manages(name: string, root: string): boolean {
     const target = this.installer.target(name)
-    return !!target && path.relative(target, root) === ''
+    return this.ctx.plugins.packageRootWritable(this.installer.root) && !!target && path.relative(target, root) === ''
   }
 
   private incompatibility(version: PackageManifest): string | undefined {
@@ -482,7 +541,7 @@ export function apply(ctx: Context, config: MarketSettings) {
   }
   const registry = new Registry(config.registry, (url, init) => ctx.http.fetch(url, init))
   const market = new Market(ctx, registry, root, new Catalog(registry, config.catalog))
-  market.installer.cleanup().catch(e => ctx.logger('market').warn(e))
+  market.cleanup().catch(e => ctx.logger('market').warn(e))
   ctx.inject(['webuiServer'], (ctx) => {
     ctx.webuiServer.route('/api/market', new Hono().route('/api/market', createMarketRoutes(ctx, market)))
   })
