@@ -9,7 +9,7 @@ import { PluginStatus, UiPrefs } from '@/plugin/internal/service/webui/FE/types/
 const Component = () => null
 const page = (owner: string, key: string, title: string, order = 100, settings = false): PageContribution =>
   ({ kind: 'page', owner, key, title, order, settings, component: Component })
-const declare = (name: string, cardinality: 'list' | 'single' | 'keyed' | 'chain', owner = 'webui'): Contribution =>
+const declare = (name: string, cardinality: 'list' | 'single' | 'keyed' | 'chain' | 'hoc', owner = 'webui'): Contribution =>
   ({ kind: 'declaration', owner, name, title: name, cardinality })
 const slot = (owner: string, name: string, id: string, extra: Partial<Pick<SlotContribution, 'order' | 'priority' | 'match'>> = {}): SlotContribution =>
   ({ kind: 'slot', owner, slot: name, id, order: extra.order ?? 100, priority: extra.priority ?? 0, match: extra.match, options: {}, component: Component })
@@ -27,11 +27,25 @@ function status(name: string, state: PluginStatus['state']): PluginStatus {
 }
 
 describe('plugin UI registry', () => {
+  it('orders page wrappers, matching both general and page-specific wrappers while respecting visibility', () => {
+    const contributions = [declare('page.content', 'hoc'),
+      slot('a', 'page.content', 'general', { order: 20 }),
+      slot('b', 'page.content', 'target', { order: 10, match: 'dashboard' }),
+      slot('b', 'page.content', 'other', { order: 0, match: 'webqq' }),
+      slot('off', 'page.content', 'off', { order: 0 }),
+    ]
+    const active = new Set(['a', 'b'])
+    expect(slotContents(contributions, active, 'page.content', NO_PREFS, 'dashboard').map(c => c.id)).toEqual(['target', 'general'])
+    expect(slotContents(contributions, active, 'page.content', NO_PREFS, 'webqq').map(c => c.id)).toEqual(['other', 'general'])
+    expect(slotContents(contributions, active, 'page.content', { hidden: ['a|page.content|general'], order: {} }, 'dashboard').map(c => c.id)).toEqual(['target'])
+    expect(slotContents(contributions, active, 'page.content').map(c => c.id)).toEqual(['general'])
+  })
+
   it('lists the pages of enabled plugins whatever their state, and slot contents of running ones only', () => {
     const contributions: Contribution[] = [
       page('b', 'b:stats', 'Stats'),
       page('a', 'a:home', 'Home'),
-      page('builtin:webqq', 'webqq', 'WebQQ', 0),
+      page('builtin:dashboard', 'dashboard', '状态面板', 0),
       page('stopped', 'stopped:x', 'X'),
       page('builtin:satori', 'satori', 'Satori', 11, true),
       page('builtin:milky', 'milky', 'Milky', 12, true),
@@ -42,17 +56,17 @@ describe('plugin UI registry', () => {
       slot('a', 'nobody.declares', 'lost'),
     ]
     const plugins = [
-      status('a', 'active'), status('b', 'active'), status('builtin:webqq', 'active'), status('stopped', 'pending'),
+      status('a', 'active'), status('b', 'active'), status('builtin:dashboard', 'active'), status('stopped', 'pending'),
       status('builtin:satori', 'failed'), status('builtin:milky', 'disposed'),
     ]
     const active = activeOwners(plugins)
     // A waiting or failing plugin keeps its pages in the sidebar (they say why it does not run); a disabled one only
     // keeps them openable
-    expect(visiblePages(contributions, plugins).map(p => p.key)).toEqual(['webqq', 'satori', 'a:home', 'b:stats', 'stopped:x'])
+    expect(visiblePages(contributions, plugins).map(p => p.key)).toEqual(['dashboard', 'satori', 'a:home', 'b:stats', 'stopped:x'])
     expect(visiblePages(contributions, plugins, 'open').map(p => p.key))
-      .toEqual(['webqq', 'satori', 'milky', 'a:home', 'b:stats', 'stopped:x'])
+      .toEqual(['dashboard', 'satori', 'milky', 'a:home', 'b:stats', 'stopped:x'])
     // Before the list loads, every plugin counts as enabled
-    expect(visiblePages(contributions, null).map(p => p.key)).toEqual(['webqq', 'satori', 'milky', 'a:home', 'b:stats', 'stopped:x'])
+    expect(visiblePages(contributions, null).map(p => p.key)).toEqual(['dashboard', 'satori', 'milky', 'a:home', 'b:stats', 'stopped:x'])
     expect(slotContents(contributions, active, 'dashboard.cards').map(s => s.owner)).toEqual(['a', 'b'])
     // Waits for someone to declare it
     expect(slotContents(contributions, active, 'nobody.declares')).toEqual([])
@@ -230,8 +244,8 @@ describe('plugin UI registry', () => {
     // The Dashboard's are its own plugin's now, and plugins say their notices on their own pages
     expect(names).not.toContain('dashboard.cards')
     expect(names).not.toContain('shell.notices')
-    // Plugins' settings are on their cards, not in the WebUI's settings dialog
-    expect(names).not.toContain('settings.sections')
+    // Appearance extensions can add settings; plugin configuration still has its own card/page.
+    expect(names).toContain('settings.sections')
     expect(() => add(declare('plugins.toolbar', 'list', 'intruder'))).toThrow(/declared by builtin:webui already/)
   })
 

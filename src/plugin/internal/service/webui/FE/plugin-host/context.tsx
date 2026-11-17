@@ -8,6 +8,8 @@ import { apiFetch, authorizedFetch, getToken } from '../utils/api'
 import { clearFailure, reportFailure } from './failures'
 import { usePluginList } from './pluginList'
 import { Contribution, useRegistry } from './registry'
+import { getTheme, overrideTokens, registerStyle, registerTheme, themeKey } from './themes'
+import { useThemeStore } from '../stores/themeStore'
 
 const PluginContext = createContext<WebUIContext | null>(null)
 
@@ -39,7 +41,8 @@ export function withToken(path: string): string {
 }
 
 /** Everything registered through it is passed to `track`, so that unloading the plugin removes it. */
-export function createWebUIContext(owner: string, builtin: boolean, track: (dispose: () => void) => void): WebUIContext {
+export function createWebUIContext(owner: string, builtin: boolean, track: (dispose: () => void) => void, moduleUrl?: string): WebUIContext {
+  const managed = (dispose: () => void) => { track(dispose); return dispose }
   const register = (contribution: Contribution) => {
     const dispose = useRegistry.getState().add(contribution)
     track(dispose)
@@ -54,6 +57,22 @@ export function createWebUIContext(owner: string, builtin: boolean, track: (disp
   })
   const ctx: WebUIContext = {
     plugin: { name: owner },
+    theme: {
+      register: definition => managed(registerTheme(owner, definition)),
+      overrideTokens: (id, tokens) => managed(overrideTokens(owner, id, tokens)),
+      get: getTheme,
+      select: id => useThemeStore.getState().select(id === 'default' ? id : themeKey(owner, id)),
+    },
+    style: (id, css, options) => managed(registerStyle(owner, id, css, options)),
+    asset(path) {
+      if (!moduleUrl || /^(data|blob):/.test(moduleUrl)) throw new Error('Assets require a served plugin WebUI module')
+      if (!path || /^[\/\\]|^[a-z][a-z0-9+.-]*:/i.test(path) || /[\\]/.test(path)) throw new Error('Asset path must be relative to the WebUI module')
+      const base = new URL('.', new URL(moduleUrl, window.location.href))
+      const url = new URL(path, base)
+      const relative = decodeURIComponent(url.pathname.slice(base.pathname.length))
+      if (url.origin !== base.origin || !url.pathname.startsWith(base.pathname) || relative.split(/[\/\\]/).includes('..')) throw new Error('Asset path leaves the WebUI directory')
+      return url.href
+    },
     page: options => register({
       kind: 'page',
       owner,
@@ -148,6 +167,12 @@ interface BoundaryProps {
 
 const asError = (error: unknown) => (error instanceof Error ? error : new Error(String(error)))
 
+/** Also used inside plugin-created portals: React context crosses the portal, CSS scope needs a DOM root. */
+export function PluginSurface({ children }: { children?: ReactNode }) {
+  const ctx = useContext(PluginContext)
+  return ctx ? <span data-plugin-ui={ctx.plugin.name} style={{ display: 'contents' }}>{children}</span> : <>{children}</>
+}
+
 /** Gives plugin components their context and keeps one that throws from taking the WebUI down with it. */
 export class PluginBoundary extends React.Component<BoundaryProps, { error: Error | null }> {
   state = { error: null as Error | null }
@@ -194,7 +219,7 @@ export class PluginBoundary extends React.Component<BoundaryProps, { error: Erro
       : <div className="flex justify-center py-8"><Loader2 size={28} className="animate-spin text-pink-500" /></div>
     return (
       <PluginContext.Provider value={contexts.get(owner) ?? null}>
-        <Suspense fallback={loading}>{children}</Suspense>
+        <PluginSurface><Suspense fallback={loading}>{children}</Suspense></PluginSurface>
       </PluginContext.Provider>
     )
   }

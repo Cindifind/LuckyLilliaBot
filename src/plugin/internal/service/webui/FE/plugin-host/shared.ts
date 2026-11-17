@@ -2,6 +2,7 @@ import * as React from 'react'
 import * as ReactDOM from 'react-dom'
 import * as jsxRuntime from 'react/jsx-runtime'
 import * as sdk from './sdk'
+import { PluginSurface } from './context'
 
 declare global {
   // eslint-disable-next-line no-var
@@ -14,11 +15,17 @@ declare global {
  * WebUI's own React, so plugin components and the WebUI share hooks and context.
  */
 export function installSharedModules() {
+  const dom = {
+    ...ReactDOM,
+    createPortal: ((children, container, key) => ReactDOM.createPortal(
+      React.createElement(PluginSurface, null, children), container, key,
+    )) as typeof ReactDOM.createPortal,
+  }
   globalThis.__LLBOT_WEBUI__ = {
     modules: {
       'react': React,
       'react/jsx-runtime': jsxRuntime,
-      'react-dom': ReactDOM,
+      'react-dom': { ...dom, default: dom },
       '@luckylillia/plugin-sdk/webui': sdk,
     },
   }

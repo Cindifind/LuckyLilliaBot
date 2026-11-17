@@ -51,6 +51,12 @@ export function setGlassSource(canvas: HTMLCanvasElement | null, cpuMirror: HTML
   source = canvas
   mirror = cpuMirror
   mirrorCtx = cpuMirror ? cpuMirror.getContext('2d', { willReadFrequently: true }) : null
+  if (!canvas) {
+    for (const entry of entries.values()) {
+      if (entry.lens && entry.ctx) entry.ctx.clearRect(0, 0, entry.lens.width, entry.lens.height)
+    }
+    resetGlassAdaptive()
+  }
 }
 
 /*
@@ -63,6 +69,9 @@ export function resetGlassAdaptive() {
     e.el.classList.remove('glass-on-dark', 'glass-on-light')
     e.onDark = false
     e.fresh = true
+    const style = getComputedStyle(e.el)
+    e.band = parseFloat(style.getPropertyValue('--lens-band')) || 14
+    e.saturate = `saturate(${style.getPropertyValue('--glass-saturate').trim() || '160%'})`
     heat(e)
   }
 }

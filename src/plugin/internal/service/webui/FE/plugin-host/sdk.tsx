@@ -26,6 +26,7 @@ import { PageNotice, PageViewContext, SlotOutlet, useSlotMatches } from './views
 // builtin ones through the alias in vite.config.ts. Keep its exports in step with sdkExports.ts.
 
 export { usePluginContext, useSlotMatches, PluginIcon }
+export { useTheme } from './themes'
 export { Lightbox } from '../components/common/Lightbox'
 export { PluginMetaRow } from '../components/plugins/PluginMetaRow'
 

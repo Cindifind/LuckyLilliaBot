@@ -20,10 +20,10 @@ function setError(owner: string, error?: string) {
   })
 }
 
-function run(owner: string, apply: WebUIPlugin, builtin: boolean): () => void {
+function run(owner: string, apply: WebUIPlugin, builtin: boolean, moduleUrl?: string): () => void {
   clearFailuresOf(owner)
   const disposers: (() => void)[] = []
-  const ctx = createWebUIContext(owner, builtin, dispose => disposers.push(dispose))
+  const ctx = createWebUIContext(owner, builtin, dispose => disposers.push(dispose), moduleUrl)
   const dispose = () => {
     for (const undo of disposers.splice(0).reverse()) undo()
   }
@@ -69,7 +69,7 @@ export function ensureClient(owner: string, url: string): Promise<void> {
         loaded.get(owner)?.dispose()
         bundled.get(owner)?.dispose()
         bundled.delete(owner)
-        loaded.set(owner, { url, dispose: run(owner, apply, !!builtinClients[owner]) })
+        loaded.set(owner, { url, dispose: run(owner, apply, !!builtinClients[owner], url) })
         if (useClientErrors.getState().errors[owner] && builtinClients[owner]) {
           const error = useClientErrors.getState().errors[owner]
           loaded.get(owner)?.dispose()

@@ -52,9 +52,10 @@ export interface PageOptions {
  *   with that `match` shows, else the slot's own content
  * - `chain` every one, wrapped around each other in `order`, the first outermost: each gets what the rest drew in
  *   `next`, around the slot's own content, and may wrap it, change it or pass it through
+ * - `hoc` wrappers receiving `children`, in `order` with the first outermost; `match` optionally selects a page
  * Replacing what is there is only ever possible where a slot is `single` or `keyed`, changing it where it is `chain`.
  */
-export type SlotCardinality = 'list' | 'single' | 'keyed' | 'chain'
+export type SlotCardinality = 'list' | 'single' | 'keyed' | 'chain' | 'hoc'
 
 /**
  * The slots, by name, with the props the slot hands its contributions and the options they describe themselves
@@ -68,6 +69,16 @@ export type SlotCardinality = 'list' | 'single' | 'keyed' | 'chain'
  * The props of a `chain` slot include `next`, which the slot passes on itself.
  */
 export interface SlotMap {
+  /** Actions beside the page title (also available in the mobile header). */
+  'page.header.actions': { props: { page: WebUIPageInfo }; options: {} }
+  /** Page wrappers, `hoc`: render children. `match` optionally limits a wrapper to a page key. Core management pages are excluded. */
+  'page.content': { props: { page: WebUIPageInfo; children: unknown }; options: {} }
+  'sidebar.header': { props: {}; options: {} }
+  'sidebar.footer': { props: {}; options: {} }
+  /** Active theme owner's controls, inside a collapsed "主题设置" disclosure; return null when no controls apply. */
+  'settings.appearance': { props: {}; options: {} }
+  /** Additional settings cards; the host draws the card and its optional title. */
+  'settings.sections': { props: {}; options: { title?: string } }
   /** Additional actions in the plugin page's filter toolbar. */
   'plugins.toolbar': { props: {}; options: {} }
   /** Additional views opened from the plugin page's toolbar. Catalogs use plugins.catalog. */
@@ -300,9 +311,72 @@ export interface ApiOptions {
   body?: unknown
 }
 
+export interface WebUIPageInfo { key: string; owner: string; title: string; fullscreen: boolean }
+export type ThemeMode = 'light' | 'dark' | 'auto'
+/** Semantic CSS custom properties, e.g. --accent, --text-primary, --r-card. */
+export type ThemeTokens = Record<string, string>
+export interface ThemeVariant {
+  tokens: ThemeTokens
+  /** CSS background shorthand. When present, replaces the default animated wallpaper. Use ctx.asset() for images. */
+  background?: string
+}
+export interface ThemeDefinition {
+  /** Unique within this plugin. The stored key is <package>|<id>. */
+  id: string
+  title: string
+  description?: string
+  light: ThemeVariant
+  dark: ThemeVariant
+  /** Optional stylesheet, installed only while this theme is selected and its plugin runs. */
+  css?: string
+}
+export interface ThemeInfo {
+  key: string
+  owner: string
+  id: string
+  title: string
+  description?: string
+  available: boolean
+}
+export interface ThemeSnapshot {
+  mode: ThemeMode
+  isDark: boolean
+  /** Saved preference; preserved while its plugin is unavailable. 'default' is the built-in theme. */
+  selected: string
+  /** Effective theme, falling back to 'default' until the selected plugin runs. */
+  active: string
+  background?: string
+  themes: ThemeInfo[]
+}
+export interface ThemeController {
+  register(theme: ThemeDefinition): () => void
+  /** Later layers win. A source replaces its previous layer; cleanup never removes a newer layer. */
+  overrideTokens(source: string, tokens: { light: ThemeTokens; dark: ThemeTokens }): () => void
+  get(): ThemeSnapshot
+  /** Selects one of this plugin's theme ids, or 'default'. Selection is saved in this browser. */
+  select(id: string): void
+}
+export interface ThemeState extends ThemeSnapshot {
+  /** Selects a theme by its full key from themes, or 'default'. */
+  select(key: string): void
+  setMode(mode: ThemeMode): void
+}
+export interface StyleOptions {
+  /** Global CSS by default. 'plugin' limits selectors to this plugin's rendered components and portals. */
+  scope?: 'global' | 'plugin'
+  /** Active by default. Scoped component utilities can stay 'loaded' for disabled configuration pages. */
+  when?: 'active' | 'loaded'
+}
+export declare function useTheme(): ThemeState
+
 export interface WebUIContext {
   /** The package this module belongs to. */
   readonly plugin: { readonly name: string }
+  readonly theme: ThemeController
+  /** A managed stylesheet: active by default, removed on module disposal. See StyleOptions for scoped component CSS. */
+  style(id: string, css: string, options?: StyleOptions): () => void
+  /** Resolves a file relative to this module inside its served WebUI directory. */
+  asset(path: string): string
   /** Adds a sidebar page, listed while the plugin is enabled; see `PageOptions.settings`. */
   page(options: PageOptions): () => void
   /**

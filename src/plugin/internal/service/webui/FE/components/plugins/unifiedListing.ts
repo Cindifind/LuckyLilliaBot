@@ -50,7 +50,8 @@ export function mergePluginItems(plugins: PluginStatus[], sources: CatalogSource
     if (!seen.has(name)) items.push({ key: `catalog:${name}`, catalog: entry, source })
   }
   const rank = (item: PluginListItem) => CATEGORIES.findIndex(category => category.key === itemCategory(item))
-  return items.sort((a, b) => rank(a) - rank(b) || Number(itemBuiltin(b)) - Number(itemBuiltin(a))
+  const enabled = (item: PluginListItem) => !!item.plugin && !item.plugin.disabled
+  return items.sort((a, b) => Number(enabled(b)) - Number(enabled(a)) || rank(a) - rank(b) || Number(itemBuiltin(b)) - Number(itemBuiltin(a))
     || Number(isInstalled(b)) - Number(isInstalled(a)) || itemName(a).localeCompare(itemName(b)) || a.key.localeCompare(b.key))
 }
 

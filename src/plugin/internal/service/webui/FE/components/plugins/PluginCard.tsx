@@ -77,7 +77,8 @@ const PluginCard: React.FC<PluginCardProps> = ({
     manifest: { icon: plugin?.manifest.icon ?? catalog?.icon },
   }
   const canUpdate = !!(packageStatus?.managed && updateInfo?.update && onUpdate)
-  const canUninstall = !!(packageStatus?.managed && !builtin && onUninstall)
+  const missing = plugin?.state === 'missing'
+  const canUninstall = !!((packageStatus?.managed || missing || plugin?.removal) && !builtin && !plugin?.core && onUninstall)
   const canReinstall = plugin?.state === 'missing' && !packageStatus && !!catalog && !!onInstall
   const packageNote = packageStatus?.managed === false ? '本地目录'
     : updateInfo?.update ? `可更新至 ${updateInfo.update}`
@@ -171,7 +172,7 @@ const PluginCard: React.FC<PluginCardProps> = ({
               </button>
             )}
             {canUninstall && (
-              <button type="button" title="卸载" aria-label={`卸载 ${title}`} disabled={disabled} onClick={() => setConfirmUninstall(true)} aria-haspopup="dialog" className={`${actionButton} hover:!text-red-500`}>
+              <button type="button" title={missing ? '移除' : '卸载'} aria-label={`${missing ? '移除' : '卸载'} ${title}`} disabled={disabled} onClick={() => setConfirmUninstall(true)} aria-haspopup="dialog" className={`${actionButton} hover:!text-red-500`}>
                 <Trash2 size={17} />
               </button>
             )}
@@ -195,7 +196,7 @@ const PluginCard: React.FC<PluginCardProps> = ({
       </PluginMetaRow>
 
       {confirmUninstall && canUninstall && (
-        <PluginUninstallDialog title={title} packageName={packageName!} busy={!!disabled}
+        <PluginUninstallDialog title={title} packageName={packageName!} busy={!!disabled} missing={missing} location={plugin?.removal}
           onClose={() => setConfirmUninstall(false)}
           onConfirm={keepConfig => { setConfirmUninstall(false); onUninstall?.(keepConfig) }} />
       )}

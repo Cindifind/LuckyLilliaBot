@@ -50,6 +50,16 @@ export const clearListenerError = (id: string) => request<PluginStatus>(`/${id}/
 
 export const removePlugin = (id: string) => request<null>(`/${id}`, { method: 'DELETE' })
 
+/** Removes this instance's entries for a missing package, optionally archiving their configuration. */
+export const removeMissingPlugin = (id: string, keepConfig: boolean) =>
+  request<{ removed: string[] }>(`/${id}/remove-missing`, { method: 'POST', body: JSON.stringify({ keepConfig }) })
+
+/** Also supports local directories and developer links, without requiring the market plugin. */
+export const uninstallPlugin = (id: string, keepConfig: boolean) =>
+  request<{ removed: string[]; instances: { instance: string; status: string; reason?: string }[] }>(`/${id}/uninstall`, {
+    method: 'POST', body: JSON.stringify({ keepConfig }),
+  })
+
 export const describePlugin = (id: string) => request<PluginDescription>(`/${id}/schema`)
 
 export const getPluginDependencies = (id: string) => request<DependencyReport>(`/${id}/dependencies`)

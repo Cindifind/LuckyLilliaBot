@@ -23,7 +23,7 @@ const names = (plugins: PluginStatus[]) => plugins.map(plugin => plugin.name)
 describe('plugin listing', () => {
   it('lists the protocol category first, builtins in the bot order, the rest by name', () => {
     const plugins = [
-      entry('builtin:webqq', { builtin: true }, 'tool'),
+      entry('@luckylillia/plugin-webqq', {}, 'tool'),
       entry('zeta-reply', {}, 'chat'),
       entry('builtin:qq-official', { builtin: true }, 'protocol'),
       entry('alpha-reply', {}, 'chat'),
@@ -37,7 +37,7 @@ describe('plugin listing', () => {
       'builtin:qq-official', 'builtin:nt-protocol', 'telegram',
       'builtin:onebot11',
       'alpha-reply', 'zeta-reply',
-      'builtin:webqq',
+      '@luckylillia/plugin-webqq',
       'db-driver',
       'uncategorized',
     ])

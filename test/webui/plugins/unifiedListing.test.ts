@@ -60,12 +60,12 @@ describe('unified plugin list', () => {
     expect(itemBuiltin(items[0])).toBe(true)
   })
 
-  it('keeps separate local instances while sharing package metadata and update actions', () => {
-    const first = plugin('multi', { id: 'a' })
-    const second = plugin('multi', { id: 'b', disabled: true, state: 'disposed' })
+  it('keeps enabled instances first while sharing package metadata and update actions', () => {
+    const first = plugin('multi', { id: 'b', state: 'pending' })
+    const second = plugin('multi', { id: 'a', disabled: true, state: 'disposed' })
     const market = source({ items: [entry('multi')], installed: [installed('multi')], updates: { multi: { update: '2.0.0' } } })
-    const items = mergePluginItems([first, second], [market])
-    expect(items.map(item => item.key)).toEqual(['entry:a', 'entry:b'])
+    const items = mergePluginItems([second, first], [market])
+    expect(items.map(item => item.key)).toEqual(['entry:b', 'entry:a'])
     expect(items.map(item => item.plugin)).toEqual([first, second])
     expect(items.every(item => item.source === market && item.updateInfo?.update === '2.0.0')).toBe(true)
     expect(filterPluginItems(items, { ...filters, installation: 'uninstalled' })).toEqual([])

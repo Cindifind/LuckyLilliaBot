@@ -3,6 +3,7 @@
  * vite.config.ts writes re-exports these names. A test keeps the list in step with the module.
  */
 export const SDK_EXPORTS = [
+  'useTheme',
   'usePluginContext', 'usePluginStatus', 'usePluginConfig', 'SchemaForm', 'SchemaSettings', 'HostInput', 'PathInput',
   'DurationInput', 'SelectInput', 'usePlugins', 'useBots', 'usePageView', 'useSidebar', 'StatusNotice', 'Slot', 'useSlotMatches', 'Icon', 'Lightbox', 'PluginMetaRow', 'PluginIcon',
 ]

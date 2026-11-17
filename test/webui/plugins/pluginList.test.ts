@@ -32,7 +32,7 @@ class PluginEventSource extends EventTarget {
 }
 
 const flush = () => new Promise<void>(resolve => setImmediate(resolve))
-const pendingPlugin: PluginStatus = { ...initial, id: 'webqq', name: 'builtin:webqq', disabled: false, state: 'pending', missingDeps: ['app'] }
+const pendingPlugin: PluginStatus = { ...initial, id: 'webqq', name: '@luckylillia/plugin-webqq', disabled: false, state: 'pending', missingDeps: ['app'] }
 const activePlugin: PluginStatus = { ...pendingPlugin, state: 'active', missingDeps: [] }
 const prefs = { hidden: [], order: {} }
 

@@ -1,7 +1,7 @@
 import { PluginStatus } from '../../types/plugins'
 import { pluginDescription, pluginTitle } from './meta'
 
-export type CategoryKey = 'protocol' | 'adapter' | 'chat' | 'tool' | 'service' | 'other'
+export type CategoryKey = 'protocol' | 'adapter' | 'chat' | 'tool' | 'service' | 'theme' | 'other'
 
 /** The categories of the plugin page, in order; `llbot.category` names one (plugin-sdk's PluginCategory). */
 export const CATEGORIES: { key: CategoryKey; label: string; hint: string }[] = [
@@ -10,6 +10,7 @@ export const CATEGORIES: { key: CategoryKey; label: string; hint: string }[] = [
   { key: 'chat', label: '消息互动', hint: '收到消息后做出回应：自动回复、复读、小游戏' },
   { key: 'tool', label: '工具', hint: '为自己启用的功能：WebQQ、通知、黑名单' },
   { key: 'service', label: '依赖组件', hint: '给其他插件提供服务，按需启用' },
+  { key: 'theme', label: '主题', hint: '改变 WebUI 的配色、背景和界面样式' },
   { key: 'other', label: '其他', hint: '不属于以上分类的，以及没写分类的插件' },
 ]
 

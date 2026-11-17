@@ -8,7 +8,7 @@ import { contributionKey, useRegistry } from '../../plugin-host/registry'
 import { configurableSlots } from '../../plugin-host/slotLayout'
 import { showToast } from '../common'
 import type { PluginStatus } from '../../types/plugins'
-import { getPluginDetails, reloadPlugin, scanPlugins, TrustRequiredError } from '../../utils/pluginApi'
+import { getPluginDetails, reloadPlugin, removeMissingPlugin, scanPlugins, TrustRequiredError, uninstallPlugin } from '../../utils/pluginApi'
 import PluginCard from './PluginCard'
 import { findConflicts, pluginDescription, pluginTitle } from './meta'
 import { CATEGORIES, pageNumbers, paginate, type OriginFilter, type StatusFilter } from './listing'
@@ -112,6 +112,19 @@ const PluginsPage: React.FC = () => {
     if (result.status === 'reloaded') showToast(plugin.builtin ? '已重启' : '已重新加载', 'success')
     else showToast(`需要重启 Bot 才能生效：${result.reason}`, 'warning')
   })
+  const removeMissing = (plugin: PluginStatus, keepConfig: boolean) => withBusy(plugin.id, async () => {
+    await removeMissingPlugin(plugin.id, keepConfig)
+    await refresh()
+    showToast(`已移除「${pluginTitle(plugin)}」`, 'success')
+  })
+  const uninstall = (plugin: PluginStatus, keepConfig: boolean) => withBusy(plugin.id, async () => {
+    const result = await uninstallPlugin(plugin.id, keepConfig)
+    await refresh()
+    for (const source of catalog.sources) source.state.refresh()
+    const failed = result.instances.filter(instance => instance.status === 'failed')
+    if (failed.length) showToast(`插件已移除，但部分实例未完成同步：${failed.map(instance => `${instance.instance}: ${instance.reason ?? '未知错误'}`).join('；')}`, 'warning')
+    else showToast(`已卸载「${pluginTitle(plugin)}」`, 'success')
+  })
   const scan = async () => {
     if (packageBusy || scanning) return
     setScanning(true)
@@ -159,7 +172,10 @@ const PluginsPage: React.FC = () => {
       onReload={plugin ? () => { void reload(plugin) } : undefined}
       onInstall={(!isInstalled(item) || (plugin?.state === 'missing' && !packageStatus)) && entry && ready ? () => { void packageAction(() => source!.state.install(entry.name, entry.version)) } : undefined}
       onUpdate={packageStatus?.managed && updateInfo?.update && ready ? () => { void packageAction(() => source!.state.update(name)) } : undefined}
-      onUninstall={packageStatus?.managed && !packageStatus.builtin && ready ? keepConfig => { void packageAction(() => source!.state.uninstall(name, { keepConfig })) } : undefined}
+      onUninstall={plugin?.state === 'missing' && !plugin.builtin && !plugin.core
+        ? keepConfig => { void removeMissing(plugin, keepConfig) }
+        : plugin?.removal && !plugin.builtin && !plugin.core ? keepConfig => { void uninstall(plugin, keepConfig) }
+          : packageStatus?.managed && !packageStatus.builtin && ready ? keepConfig => { void packageAction(() => source!.state.uninstall(name, { keepConfig })) } : undefined}
       onDetails={() => setDetailsOf(plugin ? {
         name: plugin.packageName ?? plugin.name, title: pluginTitle(plugin), version: plugin.version,
         description: pluginDescription(plugin) ?? entry?.description, author: plugin.author ?? entry?.author,

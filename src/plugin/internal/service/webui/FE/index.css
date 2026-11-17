@@ -494,6 +494,20 @@
 }
 
 @layer utilities {
+  /* A theme may register the slot but render null for its current variant.
+     Ignore empty PluginSurface roots too, so an empty disclosure stays hidden. */
+  .theme-settings:not(:has(> .theme-settings-body > :not(:empty))) {
+    display: none;
+  }
+
+  .theme-settings > summary {
+    list-style: none;
+  }
+
+  .theme-settings > summary::-webkit-details-marker {
+    display: none;
+  }
+
   /* The WebUI's frame around a slot contribution goes with it when it renders nothing; a utility, to beat .flex */
   .slot-frame:has(> .slot-body:empty) {
     display: none;

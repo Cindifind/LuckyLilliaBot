@@ -6,11 +6,15 @@ interface PluginUninstallDialogProps {
   title: string
   packageName: string
   busy: boolean
+  /** Only the current instance's entries remain; there are no package files to uninstall. */
+  missing?: boolean
+  location?: { path: string; kind: 'directory' | 'link' }
   onClose(): void
   onConfirm(keepConfig: boolean): void
 }
 
-const PluginUninstallDialog: React.FC<PluginUninstallDialogProps> = ({ title, packageName, busy, onClose, onConfirm }) => {
+const PluginUninstallDialog: React.FC<PluginUninstallDialogProps> = ({ title, packageName, busy, missing, location, onClose, onConfirm }) => {
+  const action = missing ? '移除' : '卸载'
   const dialog = useRef<HTMLDialogElement>(null)
   const cancel = useRef<HTMLButtonElement>(null)
   const titleId = useId()
@@ -43,21 +47,24 @@ const PluginUninstallDialog: React.FC<PluginUninstallDialogProps> = ({ title, pa
       <div className="flex items-start gap-3 p-4 sm:p-5 hairline-b">
         <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-red-100 dark:bg-red-950/50 text-red-500"><Trash2 size={20} /></div>
         <div className="min-w-0 flex-1">
-          <h3 id={titleId} className="text-base sm:text-lg font-semibold break-words [overflow-wrap:anywhere]">卸载「{title}」</h3>
+          <h3 id={titleId} className="text-base sm:text-lg font-semibold break-words [overflow-wrap:anywhere]">{action}「{title}」</h3>
           <p className="mt-1 text-xs text-theme-muted font-mono break-all">{packageName}</p>
         </div>
-        <button type="button" title="关闭" aria-label="取消卸载" onClick={onClose} className="shrink-0 rounded-lg p-1.5 text-theme-muted hover:bg-theme-item hover:text-theme"><X size={19} /></button>
+        <button type="button" title="关闭" aria-label={`取消${action}`} onClick={onClose} className="shrink-0 rounded-lg p-1.5 text-theme-muted hover:bg-theme-item hover:text-theme"><X size={19} /></button>
       </div>
       <div className="p-4 sm:p-5">
-        <p id={descriptionId} className="text-sm text-theme-secondary">卸载会停用此插件的全部实例并删除插件文件。</p>
+        <p id={descriptionId} className="text-sm text-theme-secondary">{missing ? '插件文件已缺失，将从当前 Bot 实例的列表中移除此插件的全部条目。'
+          : location?.kind === 'link' ? '卸载会停用使用此链接的插件实例，并删除插件目录中的链接。链接指向的原始文件会保留。'
+            : '卸载会停用此插件的全部实例并删除插件目录。'}</p>
+        {!missing && location && <p className="mt-2 text-xs text-theme-muted font-mono break-all">{location.path}</p>}
         <label htmlFor={keepConfigId} className="mt-4 inline-flex items-center gap-2 text-sm text-theme">
           <input id={keepConfigId} type="checkbox" checked={keepConfig} onChange={event => setKeepConfig(event.target.checked)} disabled={busy} className="accent-pink-500" />
           保留配置
         </label>
-        <p className="mt-1 text-xs text-theme-muted">{keepConfig ? '重新安装时恢复各实例的配置，插件保持停用。' : '同时删除此插件全部实例的配置，重新安装需重新设置。'}</p>
+        <p className="mt-1 text-xs text-theme-muted">{keepConfig ? '重新安装时恢复当前 Bot 实例中各条目的配置，插件保持停用。' : '同时删除当前 Bot 实例中此插件全部条目的配置，重新安装需重新设置。'}</p>
         <div className="mt-5 flex flex-wrap justify-end gap-2">
           <button ref={cancel} type="button" autoFocus onClick={onClose} className="btn-glass">取消</button>
-          <button type="button" disabled={busy} onClick={() => onConfirm(keepConfig)} className="inline-flex items-center justify-center gap-1.5 rounded-full bg-red-500 px-4 py-2 text-sm font-medium text-white hover:bg-red-600 disabled:opacity-40 disabled:pointer-events-none">确认卸载</button>
+          <button type="button" disabled={busy} onClick={() => onConfirm(keepConfig)} className="inline-flex items-center justify-center gap-1.5 rounded-full bg-red-500 px-4 py-2 text-sm font-medium text-white hover:bg-red-600 disabled:opacity-40 disabled:pointer-events-none">确认{action}</button>
         </div>
       </div>
     </dialog>,
