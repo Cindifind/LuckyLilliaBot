@@ -104,8 +104,8 @@ export function migrateToInstances(log: MigrationLog) {
 function keepLoginMethod(plugins: Dict | undefined): Dict {
   if (plugins && !Array.isArray(plugins.entries)) return plugins
   const file = (plugins ?? { version: 1, entries: [] }) as unknown as PluginsFile
-  if (!file.entries.some(entry => entry.name === 'builtin:nt-protocol')) {
-    const id = newEntryId(new Set(file.entries.map(entry => entry.id)))
+  if (!file.entries.some(entry => entry?.name === 'builtin:nt-protocol' || entry?.name === '@luckylillia/plugin-nt-protocol')) {
+    const id = newEntryId(new Set(file.entries.map(entry => entry?.id)))
     file.entries.push({ id, name: 'builtin:nt-protocol', config: { mode: 'direct', protocol: 'linux' } })
   }
   return file as unknown as Dict
@@ -139,7 +139,7 @@ export function liftBuiltinSettings(log: MigrationLog) {
   }
   if (email) {
     const { enabled, ...config } = email
-    setEntry(file, 'builtin:email-notification', config, !!enabled)
+    setEntry(file, '@luckylillia/plugin-ntqq-offline-email', config, !!enabled)
   }
   writeJson(pluginsFile, file as unknown as Dict)
   if (sections.length) writeJson(settingsFile, settings!)
@@ -156,8 +156,8 @@ export function renameNativeQQSettings(log: MigrationLog) {
   const pluginsFile = configPaths.plugins()
   const plugins = readJson(log, pluginsFile)?.value as PluginsFile | undefined
   if (!Array.isArray(plugins?.entries)) return
-  const config = plugins.entries.find(item => item.name === 'builtin:nt-protocol')?.config as Dict | undefined
-  if (!config || (config.mode !== 'pmhq' && !('pmhq' in config))) return
+  const config = plugins.entries.find(item => item?.name === 'builtin:nt-protocol' || item?.name === '@luckylillia/plugin-nt-protocol')?.config as Dict | undefined
+  if (!config || typeof config !== 'object' || (config.mode !== 'pmhq' && !('pmhq' in config))) return
   if (config.mode === 'pmhq') config.mode = 'nativeqq'
   if ('pmhq' in config) {
     config.nativeQQ ??= config.pmhq
@@ -167,10 +167,112 @@ export function renameNativeQQSettings(log: MigrationLog) {
   log.info('NTQQ 协议的登录方式设置已改用 NativeQQ 的名字')
 }
 
+export const EXTRACTED_PLUGINS: Readonly<Record<string, string>> = {
+  'builtin:nt-protocol': '@luckylillia/plugin-nt-protocol',
+  'builtin:onebot11': '@luckylillia/plugin-onebot11',
+  'builtin:milky': '@luckylillia/plugin-milky',
+  'builtin:email-notification': '@luckylillia/plugin-ntqq-offline-email',
+  'builtin:webqq': '@luckylillia/plugin-webqq',
+}
+
+/** NTQQ messaging is owned by the protocol package now; the old core entry has no independent settings. */
+export function migrateNTQQMessaging(log: MigrationLog) {
+  const file = configPaths.plugins()
+  const data = readJson(log, file)?.value as PluginsFile | undefined
+  if (!Array.isArray(data?.entries)) return
+  const retired = 'builtin:ntqq-universal'
+  let changed = false
+  const removedIds = new Set<string>()
+  const keep = (entry: PluginEntry) => {
+    if (entry?.name !== retired) return true
+    removedIds.add(entry.id)
+    changed = true
+    return false
+  }
+  data.entries = data.entries.filter(keep)
+  if (Array.isArray(data.retained)) data.retained = data.retained.filter(keep)
+  if (Array.isArray(data.messageOrder)) data.messageOrder = data.messageOrder.filter(id => !removedIds.has(id))
+  const retiredKey = (key: unknown) => typeof key === 'string' && (key === retired || key.startsWith(retired + '|'))
+  if (data.ui && typeof data.ui === 'object' && !Array.isArray(data.ui)) {
+    if (Array.isArray(data.ui.hidden)) data.ui.hidden = data.ui.hidden.filter(key => {
+      if (!retiredKey(key)) return true
+      changed = true
+      return false
+    })
+    const order = data.ui.order
+    if (order && typeof order === 'object' && !Array.isArray(order)) {
+      for (const key of Object.keys(order)) {
+        if (!retiredKey(key)) continue
+        delete order[key]
+        changed = true
+      }
+    }
+  }
+  if (!changed) return
+  writeJson(file, data as unknown as Dict)
+  log.info('NTQQ 消息服务已并入 NTQQ 协议插件，旧内置条目已清理')
+}
+
+/** Migrate identities only; packages are installed by the user and never receive implicit third-party trust. */
+export function migrateExtractedPlugins(log: MigrationLog) {
+  const file = configPaths.plugins()
+  const data = readJson(log, file)?.value as PluginsFile | undefined
+  if (!Array.isArray(data?.entries)) return
+  const extracted = new Set(Object.values(EXTRACTED_PLUGINS))
+  const entries = [...data.entries, ...(Array.isArray(data.retained) ? data.retained : [])]
+    .filter(entry => entry && typeof entry.name === 'string')
+  const affected = entries.filter(entry => Object.hasOwn(EXTRACTED_PLUGINS, entry.name) || extracted.has(entry.name))
+  if (!affected.length) return
+  let changed = false
+  if (data.trusted === undefined) {
+    // Keep the old host's implicit trust for pre-existing third-party packages, but not newly extracted ones.
+    data.trusted = [...new Set(data.entries.filter(entry => entry && !entry.disabled && typeof entry.name === 'string').map(entry => entry.name)
+      .filter(name => !name.startsWith('builtin:') && !extracted.has(name)))]
+    changed = true
+  }
+  for (const entry of entries) {
+    if (!Object.hasOwn(EXTRACTED_PLUGINS, entry.name)) continue
+    entry.name = EXTRACTED_PLUGINS[entry.name]
+    changed = true
+  }
+  const uiKey = (key: string) => {
+    const split = key.indexOf('|')
+    const name = split < 0 ? key : key.slice(0, split)
+    return Object.hasOwn(EXTRACTED_PLUGINS, name) ? EXTRACTED_PLUGINS[name] + key.slice(name.length) : key
+  }
+  if (data.ui && typeof data.ui === 'object' && !Array.isArray(data.ui)) {
+    if (Array.isArray(data.ui.hidden)) {
+      data.ui.hidden = data.ui.hidden.map(key => {
+        if (typeof key !== 'string') return key
+        const renamed = uiKey(key)
+        if (renamed !== key) changed = true
+        return renamed
+      })
+    }
+    const order = data.ui.order
+    for (const [key, position] of Object.entries(order && typeof order === 'object' && !Array.isArray(order) ? order : {})) {
+      const renamed = uiKey(key)
+      if (renamed === key) continue
+      if (!Object.hasOwn(order, renamed)) order[renamed] = position
+      delete order[key]
+      changed = true
+    }
+  }
+  if (!changed) return
+  writeJson(file, data as unknown as Dict)
+  log.info('NTQQ、OneBot 11、Milky、WebQQ 和 NTQQ掉线邮件通知已改为第三方插件，原设置和实例标识已保留；请安装插件并确认信任后启用')
+  for (const name of extracted) {
+    const duplicates = data.entries.filter(entry => entry?.name === name && !entry.disabled)
+    if (duplicates.length > 1) log.warn(`${name} 存在多个启用条目（${duplicates.map(entry => entry.id).join('、')}），配置均已保留；请在插件页选择要使用的条目并停用其他条目`)
+  }
+}
+
 function setEntry(file: PluginsFile, name: string, config: unknown, enabled: boolean) {
-  let entry = file.entries.find(item => item.name === name)
+  const previous = Object.keys(EXTRACTED_PLUGINS).find(key => EXTRACTED_PLUGINS[key] === name)
+  let entry = file.entries.find(item => item?.name === name)
+    ?? (previous ? file.entries.find(item => item?.name === previous) : undefined)
   if (!entry) {
-    entry = { id: newEntryId(new Set(file.entries.map(item => item.id))), name } as PluginEntry
+    entry = { id: newEntryId(new Set(file.entries.map(item => item?.id))), name } as PluginEntry
     file.entries.push(entry)
   }
   entry.config = config

@@ -3,7 +3,7 @@ import { Methods } from '@satorijs/protocol'
 import type { Bot } from '@luckylillia/plugin-sdk'
 
 // Satori clients have always seen the NT account as `llonebot`, with its own elements `llonebot:*` and faces marked
-// `platform="llonebot"`; the neutral layer names it `ntqq` (ntqq-universal/bot.ts). Everything else goes
+// `platform="llonebot"`; the NTQQ protocol plugin registers it as `ntqq`. Everything else goes
 // out under the name it has inside.
 const WIRE_NAMES: Record<string, string> = { ntqq: 'llonebot' }
 

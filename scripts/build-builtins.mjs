@@ -26,6 +26,12 @@ for (const category of await readdir(internal, { withFileTypes: true })) {
   }
 }
 
+// This scope contains generated builtin packages only. Clear it so removed or extracted entries cannot ship
+// again through stale output from an earlier build.
+const scopeOutput = path.resolve(destination, '@luckylillia')
+if (!isInside(destination, scopeOutput) || scopeOutput === destination) throw new Error('Unsafe builtin output scope')
+await rm(scopeOutput, { recursive: true, force: true })
+
 for (const dir of entries) {
   const manifest = JSON.parse(await readFile(path.join(dir, 'package.json'), 'utf8'))
   const out = path.resolve(destination, manifest.name)
@@ -35,7 +41,6 @@ for (const dir of entries) {
   await mkdir(path.join(out, 'lib'), { recursive: true })
   const owns = file => isInside(dir, file)
     || (manifest.llbot.builtin.entry === 'builtin:commands' && file === path.join(root, 'src/universal/commands.ts'))
-    || (manifest.llbot.builtin.entry === 'builtin:nt-protocol' && isInside(path.join(root, 'src/qqProtocol'), file))
   const backend = await bundle({
     absWorkingDir: root, entryPoints: [path.join(dir, 'builtin.ts')], outfile: path.join(out, 'lib/index.js'),
     bundle: true, platform: 'node', format: 'esm', target: 'node22', packages: 'external', metafile: true,
@@ -71,7 +76,7 @@ for (const dir of entries) {
       absWorkingDir: root, entryPoints: [client], outfile: path.join(out, 'lib/client/module.js'), bundle: true,
       platform: 'browser', format: 'esm', target: 'es2022', jsx: 'automatic', minify: true,
       nodePaths: [path.join(fe, 'node_modules')],
-      alias: { '@ntqqapi/types': path.join(internal, 'protocol/nt-protocol/ntqqapi/types') },
+      alias: { '@ntqqapi/types': path.join(root, 'src/ntqq/types.ts') },
       external: ['react', 'react/*', 'react-dom', 'react-dom/*', '@luckylillia/plugin-sdk/webui'],
       define: { 'process.env.NODE_ENV': '"production"' },
     })
@@ -87,6 +92,7 @@ for (const dir of entries) {
     await writeFile(path.join(out, 'lib/client/index.js'), [
       'import apply from "./module.js"',
       'export default function(ctx) {',
+      `  if (ctx.style) { ctx.style('utilities', ${JSON.stringify(styled.css)}, { scope: 'plugin', when: 'loaded' }); return apply(ctx) }`,
       '  const style = document.createElement("link")',
       '  style.rel = "stylesheet"',
       '  style.href = new URL("./style.css", import.meta.url).href',

@@ -9,6 +9,8 @@ import { JsonFile } from '@/common/jsonFile'
 import { isDevMode } from '@/common/utils/environment'
 import { configPaths } from '@/common/configPaths'
 import { DEPRECATED_KEYS, templateConfig, upgradeConfig } from './upgrade'
+import { version } from '@/version'
+import { applyLegacyConfig, legacyConfig } from './legacyConfig'
 
 declare module 'cordis' {
   interface Context {
@@ -96,6 +98,7 @@ function overlayEnv(config: LLBotConfig, warn: (message: string) => void): Map<s
  * (`--webui-port`, LLBOT_*).
  */
 export default class Config extends Service {
+  readonly version = version
   private config: LLBotConfig | null = null
   private watching = false
   private readonly json: JsonFile<Dict>
@@ -120,6 +123,15 @@ export default class Config extends Service {
 
   get file(): string {
     return this.json.file
+  }
+
+  /** Compatibility API for independently distributed protocol adapters. */
+  getLegacy() {
+    return legacyConfig(this.ctx)
+  }
+
+  patchLegacy(partial: Dict, options: { rules?: boolean } = {}): Promise<void> {
+    return applyLegacyConfig(this.ctx, partial, options)
   }
 
   listenChange(cb: (config: LLBotConfig) => void) {

@@ -2,6 +2,7 @@ import { Context } from 'cordis'
 import { Dict } from 'cosmokit'
 import { LegacyConfig } from '@/common/types'
 import { deepMerge } from '@/common/utils'
+import { PluginTrustRequiredError } from '@/plugin/host'
 import { ADAPTER_ENTRIES, ADAPTER_KEYS, DEPRECATED_KEYS } from './upgrade'
 
 /**
@@ -14,7 +15,7 @@ export function legacyConfig(ctx: Context): LegacyConfig {
   // get(): the callers (an OneBot action, a WebUI route) do not inject the plugin service
   const plugins = ctx.get('plugins')
   for (const key of ADAPTER_KEYS) {
-    const settings = plugins?.builtinSettings(ADAPTER_ENTRIES[key])
+    const settings = plugins?.entrySettings(ADAPTER_ENTRIES[key])
     if (settings) config[key] = { ...settings.config as Dict, enable: settings.enabled }
   }
   return config as LegacyConfig
@@ -36,9 +37,13 @@ export async function applyLegacyConfig(ctx: Context, partial: Dict, options: { 
   for (const key of ADAPTER_KEYS) {
     const section = rest[key] as Dict | undefined
     delete rest[key]
-    const settings = plugins?.builtinSettings(ADAPTER_ENTRIES[key])
+    const settings = plugins?.entrySettings(ADAPTER_ENTRIES[key])
     if (!section || typeof section !== 'object' || !settings) continue
     const { enable, ...changes } = section
+    // updateConfig imports the schema. Legacy APIs must not execute an untrusted package before enable rejects it.
+    if (!settings.trusted && (enable === true || Object.keys(changes).length)) {
+      throw new PluginTrustRequiredError(ADAPTER_ENTRIES[key])
+    }
     // Off first, so the rules for a running adapter do not hold up a section that switches it off anyway
     if (enable === false && settings.enabled) await plugins!.disable(settings.id)
     if (Object.keys(changes).length) {

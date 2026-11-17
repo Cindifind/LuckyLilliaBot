@@ -3,19 +3,14 @@
 import { readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { initActionMap } from '@/plugin/internal/adapter/onebot11/action'
-import { CONNECTION_ONLY, internalName } from '@/plugin/internal/service/ntqq-universal/internal'
+import accountMethods from '@/ntqq/onebot-internal.json'
 import { guildInternal, officialInternal } from '@/plugin/internal/protocol/qq-official/internal'
 
 export const SDK_INTERNAL = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../packages/plugin-sdk/src/internal.ts')
 
 /** The QQ account's methods with the OneBot action each runs, and the official bot's method names. */
 export function internalNames() {
-  const account: [string, string][] = []
-  for (const [action] of initActionMap({ ctx: {} } as never)) {
-    if (action.endsWith('_async') || action.endsWith('_rate_limited') || CONNECTION_ONLY.includes(action)) continue
-    account.push([internalName(action), action])
-  }
+  const account = Object.entries(accountMethods)
   const api = {} as never
   return {
     // Code-point order: the same file on every machine

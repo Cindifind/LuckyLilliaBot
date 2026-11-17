@@ -22,13 +22,13 @@ esac
 
 # NativeQQ: the official QQ installation and Bot share this container.
 if [ "$PROTOCOL_MODE" = "nativeqq" ]; then
-  exec node --enable-source-maps ./llbot.js --nativeqq --nativeqq-config="${NATIVEQQ_CONFIG:-/app/llbot/data/nativeqq_config.json}"
+  exec node --enable-source-maps ./llbot.js --nativeqq --nativeqq-config="${NATIVEQQ_CONFIG:-/app/llbot/data/nativeqq_config.json}" "$@"
 fi
 
 # 纯协议 (PROTOCOL_MODE 为空或 direct): --direct 锁定登录方式, 标准镜像里没有 QQ, 不能切到桥接
 # 指定 AUTO_LOGIN_QQ 重启后自动免扫码快速登录。
 # 不设 AUTO_LOGIN_QQ 则起在 WebUI 登录页, 由用户从快速登录列表点选账号 (或扫码)
 if [ -n "$AUTO_LOGIN_QQ" ]; then
-  exec node --enable-source-maps ./llbot.js --direct -q "$AUTO_LOGIN_QQ"
+  exec node --enable-source-maps ./llbot.js --direct -q "$AUTO_LOGIN_QQ" "$@"
 fi
-exec node --enable-source-maps ./llbot.js --direct
+exec node --enable-source-maps ./llbot.js --direct "$@"

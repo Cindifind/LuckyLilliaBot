@@ -9,6 +9,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { setTimeout as delay } from 'node:timers/promises'
+import { defaultNTQQPlugin, exposeNTQQPlugin, nativeBundleRoot, ntqqPackage } from './ntqq-smoke-plugin.mjs'
 
 const botRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const require = createRequire(import.meta.url)
@@ -21,9 +22,9 @@ const json = (file, data) => writeFileSync(file, JSON.stringify(data, null, 2) +
 
 function options(argv) {
   const config = { uin: process.env.LLBOT_SMOKE_UIN || '', protocol: 'linux', dataDir: path.join(botRoot, 'data'),
-    tokenFile: '', dist: path.join(botRoot, 'dist'), timeoutMs: 90_000, prepareOnly: false, expectedBuildId: '' }
+    tokenFile: '', dist: path.join(botRoot, 'dist'), pluginDir: defaultNTQQPlugin(botRoot), timeoutMs: 90_000, prepareOnly: false, expectedBuildId: '' }
   const names = new Map([['--uin', 'uin'], ['-q', 'uin'], ['--protocol', 'protocol'], ['--data-dir', 'dataDir'],
-    ['--auth-token-file', 'tokenFile'], ['--dist', 'dist'], ['--timeout-ms', 'timeoutMs'], ['--expected-build-id', 'expectedBuildId']])
+    ['--auth-token-file', 'tokenFile'], ['--dist', 'dist'], ['--plugin-dir', 'pluginDir'], ['--timeout-ms', 'timeoutMs'], ['--expected-build-id', 'expectedBuildId']])
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index]
     if (argument === '--help' || argument === '-h') return { help: true }
@@ -39,6 +40,7 @@ function options(argv) {
   check(['linux', 'macos'].includes(config.protocol), 'UNSUPPORTED_PROTOCOL')
   config.dataDir = path.resolve(config.dataDir)
   config.dist = path.resolve(config.dist)
+  config.pluginDir = path.resolve(config.pluginDir)
   config.tokenFile = path.resolve(config.tokenFile || path.join(config.dataDir, 'auth_token.txt'))
   config.timeoutMs = Number(config.timeoutMs)
   check(Number.isSafeInteger(config.timeoutMs) && config.timeoutMs >= 20_000 && config.timeoutMs <= 600_000, 'INVALID_TIMEOUT')
@@ -47,17 +49,12 @@ function options(argv) {
 
 function inspectNative(config) {
   check(existsSync(path.join(config.dist, 'llbot.js')), 'BUILT_BOT_NOT_FOUND')
-  const root = path.join(config.dist, 'native')
+  const root = nativeBundleRoot(config.pluginDir)
   const loaderPath = path.join(root, 'loader.cjs')
   check(existsSync(loaderPath), 'BUILT_NATIVE_LOADER_NOT_FOUND')
   const bundle = require(loaderPath).inspectBundle(root)
   check(bundle.manifest.variant === 'production', 'NATIVE_VARIANT_NOT_PRODUCTION')
   if (config.expectedBuildId) check(bundle.metadata.buildId === config.expectedBuildId, 'NATIVE_BUILD_ID_MISMATCH')
-  const sourceRoot = path.join(botRoot, 'src/native/production')
-  if (existsSync(path.join(sourceRoot, 'loader.cjs'))) {
-    const source = require(path.join(sourceRoot, 'loader.cjs')).inspectBundle(sourceRoot)
-    check(source.metadata.buildId === bundle.metadata.buildId, 'BUILT_NATIVE_IS_STALE')
-  }
   return { loaderPath, build: { buildId: bundle.metadata.buildId, target: bundle.target, version: bundle.metadata.package.version, variant: bundle.manifest.variant } }
 }
 
@@ -87,13 +84,13 @@ function prepare(config) {
   const webuiPassword = randomBytes(32).toString('hex')
   writeFileSync(path.join(instanceDir, 'webui_token.txt'), webuiPassword, 'utf8')
   json(path.join(instanceDir, 'settings.json'), { log: false, logLevel: 'info', msgCacheExpire: 120, webui: { enable: true, host: '127.0.0.1', port: 0 } })
-  const optional = ['dashboard', 'logs', 'onebot11', 'satori', 'milky', 'qq-official', 'webqq', 'email-notification']
-  json(path.join(instanceDir, 'plugins.json'), { version: 1, hmr: false, entries: [
-    { id: 'smoke-nt', name: 'builtin:nt-protocol', config: { mode: 'direct', protocol: config.protocol, nativeQQ: { qqPath: '' } } },
+  const optional = ['dashboard', 'logs', 'satori', 'qq-official', 'webqq', 'email-notification']
+  json(path.join(instanceDir, 'plugins.json'), { version: 1, hmr: false, trusted: [ntqqPackage], entries: [
+    { id: 'smoke-nt', name: ntqqPackage, config: { mode: 'direct', protocol: config.protocol, nativeQQ: { qqPath: '' } } },
     ...optional.map(name => ({ id: `smoke-${name}`, name: `builtin:${name}`, disabled: true })),
     { id: 'smoke-webui', name: 'builtin:webui' }, { id: 'smoke-universal', name: 'builtin:ntqq-universal' },
   ] })
-  return { directory, instance, originals, expectedUid: session.uid, webuiHash: hash(webuiPassword),
+  return { directory, pluginRoot: exposeNTQQPlugin(directory, config.pluginDir), instance, originals, expectedUid: session.uid, webuiHash: hash(webuiPassword),
     metadataLog: path.join(directory, 'sign-smoke-metadata.jsonl') }
 }
 
@@ -162,7 +159,7 @@ function observeOutput(stream, token, prefix, state, emit) {
 async function main() {
   const config = options(process.argv.slice(2))
   if (config.help) {
-    console.log('Usage: node script/sign-smoke.mjs --uin <QQ> --protocol linux|macos [--data-dir <Bot/data>] [--auth-token-file <file>] [--dist <dir>] [--expected-build-id <id>] [--timeout-ms <ms>] [--prepare-only]\nRuns the built production Bot in direct mode with a private session copy, observes real native init/signRequest calls, checks runtime UID through localhost /api/login-info and a fresh nickname query, then ends its parent so the Bot shuts itself down. Default timeout: 90 seconds. No raw credentials, signature bytes, UID, nickname, or packet body are printed.')
+    console.log('Usage: node script/sign-smoke.mjs --uin <QQ> --protocol linux|macos [--data-dir <Bot/data>] [--auth-token-file <file>] [--dist <dir>] [--plugin-dir <built NTQQ package>] [--expected-build-id <id>] [--timeout-ms <ms>] [--prepare-only]\nRuns the built production Bot in direct mode with a private session copy, observes real native init/signRequest calls, checks runtime UID through localhost /api/login-info and a fresh nickname query, then ends its parent so the Bot shuts itself down. Default timeout: 90 seconds. No raw credentials, signature bytes, UID, nickname, or packet body are printed.')
     return
   }
   const native = inspectNative(config)
@@ -189,7 +186,7 @@ async function main() {
   Object.assign(environment, { AUTH_TOKEN: token, LLBOT_LOG_LEVEL: 'info', NO_COLOR: '1',
     LLBOT_SIGN_SMOKE_LOADER: native.loaderPath, LLBOT_SIGN_SMOKE_NONCE: nonce })
   const child = spawn(process.execPath, ['--require', path.join(botRoot, 'script/sign-smoke-probe.cjs'), path.join(config.dist, 'llbot.js'),
-    `--parent-pid=${keeper.pid}`, '--instance', workspace.instance, '--protocol', config.protocol, '-q', config.uin],
+    `--parent-pid=${keeper.pid}`, '--instance', workspace.instance, '--plugin-dir', workspace.pluginRoot, '--protocol', config.protocol, '-q', config.uin],
   { cwd: workspace.directory, env: environment, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
   delete environment.AUTH_TOKEN
   const state = { outputBytes: 0, outputLines: 0, probeReady: false, nativeLoads: 0, nativeQQConstructions: 0,

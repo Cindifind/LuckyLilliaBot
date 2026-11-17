@@ -2,9 +2,9 @@ name: Test
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, V9]
   push:
-    branches: [main]
+    branches: [main, V9]
 
 jobs:
   unit-test:
@@ -32,126 +32,76 @@ jobs:
         run: npm run test:webui
 
   e2e-test:
-    name: E2E Tests
+    name: NTQQ / OneBot Host Integration
     runs-on: [self-hosted, llbot-test]
     needs: [unit-test]
     if: github.event_name == 'pull_request'
+    env:
+      ONEBOT_PLUGIN_DIR: ${{ github.workspace }}/_integration/onebot
+      NTQQ_PLUGIN_DIR: ${{ github.workspace }}/_integration/ntqq
+      FFMPEG_PLUGIN_DIR: ${{ github.workspace }}/_integration/ffmpeg
+      E2E_ROOT: ${{ github.workspace }}/output/onebot-e2e
+      QQ_BASE_IMAGE: ${{ vars.QQ_BASE_IMAGE }}
     steps:
-      - name: Cleanup root-owned files
-        run: sudo rm -rf ${{ github.workspace }}/workspace1 ${{ github.workspace }}/workspace2 ${{ github.workspace }}/test/onebot11-api-test/node_modules
+      - name: Cleanup previous fixture ownership
+        run: sudo rm -rf -- "$GITHUB_WORKSPACE/output/onebot-e2e" "$GITHUB_WORKSPACE/workspace1" "$GITHUB_WORKSPACE/workspace2"
 
-      - name: Checkout
+      - name: Checkout Bot host
         uses: actions/checkout@v4
+
+      - name: Checkout NTQQ plugin source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.NTQQ_REPOSITORY || 'LuckyLilliaDev/lucky-lillia-plugin-ntqq-protocol' }}
+          ref: ${{ vars.NTQQ_REF || 'main' }}
+          path: _integration/ntqq
+          persist-credentials: false
+
+      - name: Checkout OneBot plugin and integration suite
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.ONEBOT_REPOSITORY || 'LuckyLilliaDev/lucky-lillia-plugin-onebot11' }}
+          ref: ${{ vars.ONEBOT_REF || 'main' }}
+          path: _integration/onebot
+          persist-credentials: false
+
+      - name: Checkout optional media plugin for full API coverage
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.FFMPEG_REPOSITORY || 'LuckyLilliaDev/lucky-lillia-plugin-ffmpeg' }}
+          ref: ${{ vars.FFMPEG_REF || 'main' }}
+          path: _integration/ffmpeg
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
 
-      - name: Install dependencies
+      - name: Install and build Bot host
         run: |
           corepack enable
           yarn install --no-immutable
-          cd src/plugin/internal/service/webui/FE && npm install
-
-      - name: Build
-        run: |
+          npm install --prefix src/plugin/internal/service/webui/FE
           npm run build
           npm run build-webui
 
+      - name: Build plugin sources and prepare isolated fixtures
+        run: bash script/native-e2e.sh prepare
+
       - name: Build native QQ host image
-        env:
-          QQ_BASE_IMAGE: ${{ vars.QQ_BASE_IMAGE }}
         run: bash script/native-e2e.sh build
-
-      - name: Write configs
-        run: |
-          mkdir -p workspace1/data workspace2/data
-
-          cat > workspace1/data/config_1577491075.json << 'CONF'
-          {
-            "ob11": {
-              "enable": true,
-              "connect": [
-                { "type": "http", "enable": true, "host": "", "port": 53000, "token": "123", "messageFormat": "array", "reportSelfMessage": false, "reportOfflineMessage": false, "debug": false }
-              ]
-            },
-            "satori": { "enable": false },
-            "milky": { "enable": false },
-            "webui": { "enable": false }
-          }
-          CONF
-
-          cat > workspace2/data/config_412805684.json << 'CONF'
-          {
-            "ob11": {
-              "enable": true,
-              "connect": [
-                { "type": "http", "enable": true, "host": "", "port": 53001, "token": "123", "messageFormat": "array", "reportSelfMessage": false, "reportOfflineMessage": false, "debug": false }
-              ]
-            },
-            "satori": { "enable": false },
-            "milky": { "enable": false },
-            "webui": { "enable": false }
-          }
-          CONF
 
       - name: Start native QQ and Bot hosts
         run: bash script/native-e2e.sh start
 
-      - name: Wait for LLBot ready
-        run: |
-          for i in $(seq 1 60); do
-            R1=$(docker exec llbot-pr1 curl -sf http://127.0.0.1:53000/get_login_info -H "Authorization: Bearer 123" 2>/dev/null || true)
-            R2=$(docker exec llbot-pr2 curl -sf http://127.0.0.1:53001/get_login_info -H "Authorization: Bearer 123" 2>/dev/null || true)
-            [ -n "$R1" ] && [ -n "$R2" ] && echo "Both LLBot instances ready" && break
-            echo "Waiting... ($i/60)"
-            sleep 5
-          done
+      - name: Wait for both expected QQ identities
+        run: bash script/native-e2e.sh wait
 
-      - name: Write test config
-        run: |
-          cat > ${{ github.workspace }}/test/onebot11-api-test/config/test.config.json << 'CONF'
-          {
-            "accounts": {
-              "primary": {
-                "host": "http://llbot-pr1:53000",
-                "apiKey": "123",
-                "protocol": "http",
-                "user_id": "1577491075"
-              },
-              "secondary": {
-                "host": "http://llbot-pr2:53001",
-                "apiKey": "123",
-                "protocol": "http",
-                "user_id": "412805684"
-              }
-            },
-            "test_group_id": "1098066573",
-            "timeout": 30000,
-            "retryAttempts": 3
-          }
-          CONF
+      - name: Run OneBot integration suite against Bot host
+        run: bash script/native-e2e.sh test
 
-      - name: Run e2e tests in Docker
-        run: |
-          docker run --rm --name e2e-runner \
-            --network llbot-test_test_network \
-            -v ${{ github.workspace }}:/app/workspace:rw \
-            -w /app/workspace/test/onebot11-api-test \
-            node:24-alpine3.23 sh -c "npm install && npm test"
-        continue-on-error: true
-
-      - name: Show test summary
-        if: always()
-        run: |
-          if [ -f test/onebot11-api-test/test-report.html ]; then
-            echo "Test report generated"
-          else
-            echo "No test report found"
-          fi
-
-      - name: Stop native test hosts and restore fixture owners
+      - name: Stop hosts and restore existing fixtures
         if: always()
         run: bash script/native-e2e.sh stop
 
@@ -159,8 +109,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-test-report
-          path: test/onebot11-api-test/test-report.html
+          name: onebot-host-e2e-report
+          path: output/onebot-e2e/api/test-report.html
           retention-days: 30
 
   report:

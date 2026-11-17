@@ -563,15 +563,6 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@types/nodemailer@npm:^8.0.1":
-  version: 8.0.1
-  resolution: "@types/nodemailer@npm:8.0.1"
-  dependencies:
-    "@types/node": "npm:*"
-  checksum: 10c0/4370ac478a6811faaa64fcf769556515c72b78c66961cde22be75bb975ce8a964cfbe5e7c0988a99250f3250faa34357c73958b019b3c63dd138ea3784442032
-  languageName: node
-  linkType: hard
-
 "@types/qrcode@npm:^1.5.6":
   version: 1.5.6
   resolution: "@types/qrcode@npm:1.5.6"
@@ -1515,7 +1506,6 @@ __metadata:
     "@satorijs/protocol": "npm:^1.7.0"
     "@types/busboy": "npm:^1.5.4"
     "@types/node": "npm:^24.12.4"
-    "@types/nodemailer": "npm:^8.0.1"
     "@types/qrcode": "npm:^1.5.6"
     "@types/semver": "npm:^7"
     "@types/ws": "npm:^8.18.1"
@@ -1531,7 +1521,6 @@ __metadata:
     image-size: "npm:^2.0.2"
     json5: "npm:^2.2.3"
     milkygen: "npm:^0.3.3"
-    nodemailer: "npm:^9.1.1"
     qrcode: "npm:^1.5.4"
     schemastery: "npm:^3.18.0"
     semver: "npm:7.8.5"
@@ -1616,13 +1605,6 @@ __metadata:
   bin:
     node-gyp: bin/node-gyp.js
   checksum: 10c0/29d33ccf47ffeeb5e7af925550b416f698a26a72eb10975c7eb5775c1d0cecacd76d164a4aa45503d3ddcece209db65c712be00423c69381a4cd14e2e6540559
-  languageName: node
-  linkType: hard
-
-"nodemailer@npm:^9.1.1":
-  version: 9.1.1
-  resolution: "nodemailer@npm:9.1.1"
-  checksum: 10c0/b213a2a906697a735f6eb21103629b7a77aeac297b6d843efd4588157999bf6d19381853ac1224e472f5a34aec2e2412444151a2c6ec6e8c52150afa3055039c
   languageName: node
   linkType: hard
 

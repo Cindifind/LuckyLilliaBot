@@ -23,3 +23,4 @@ RUN set -eux; \
 VOLUME ["/app/llbot/data"]
 
 ENTRYPOINT ["/startup.sh"]
+CMD []

@@ -5,39 +5,22 @@ import * as m2 from "../../common/image-size/lib/index"
 import * as m3 from "../../common/instance"
 import * as m4 from "../../common/logger"
 import * as m5 from "../../common/platform"
-import * as m6 from "../../common/protocolErrors"
-import * as m7 from "../../common/utils/audio"
-import * as m8 from "../../common/utils/audioFormat"
-import * as m9 from "../../common/utils/environment"
-import * as m10 from "../../common/utils/ffmpeg"
-import * as m11 from "../../common/utils/file"
-import * as m12 from "../../common/utils/index"
-import * as m13 from "../../common/utils/misc"
-import * as m14 from "../../common/utils/musicCard"
-import * as m15 from "../../common/utils/port"
-import * as m16 from "../../common/utils/request"
-import * as m17 from "../../common/utils/sign"
-import * as m18 from "../../common/utils/video"
-import * as m19 from "../../main/config/index"
-import * as m20 from "../../main/config/legacyConfig"
-import * as m21 from "../../main/config/validate"
-import * as m22 from "../../main/log"
-import * as m23 from "../../native/index"
-import * as m24 from "../host/index"
-import * as m25 from "../host/manifest"
-import * as m26 from "../host/resolve-hook"
-import * as m27 from "./adapter/adapterEntry"
-import * as m28 from "./adapter/onebot11/action/index"
-import * as m29 from "./adapter/onebot11/action/OB11Response"
-import * as m30 from "./adapter/settingsTemplate"
-import * as m31 from "./protocol/nt-protocol/ntqqapi/entities"
-import * as m32 from "./protocol/nt-protocol/ntqqapi/helper/face_config.json"
-import * as m33 from "./protocol/nt-protocol/ntqqapi/helper/forwardMsg"
-import * as m34 from "./protocol/nt-protocol/ntqqapi/proto/index"
-import * as m35 from "./protocol/nt-protocol/ntqqapi/types/index"
-import * as m36 from "./protocol/nt-protocol/ntqqapi/types/msg"
-import * as m37 from "../../universal/fallback"
-import * as m38 from "../../version"
+import * as m6 from "../../common/utils/audio"
+import * as m7 from "../../common/utils/audioFormat"
+import * as m8 from "../../common/utils/environment"
+import * as m9 from "../../common/utils/port"
+import * as m10 from "../../main/config/index"
+import * as m11 from "../../main/config/legacyConfig"
+import * as m12 from "../../main/config/validate"
+import * as m13 from "../../main/log"
+import * as m14 from "../host/index"
+import * as m15 from "../host/manifest"
+import * as m16 from "../host/resolve-hook"
+import * as m17 from "../host/shared-packages"
+import * as m18 from "./adapter/adapterEntry"
+import * as m19 from "./adapter/settingsTemplate"
+import * as m20 from "../../universal/fallback"
+import * as m21 from "../../version"
 import { registerBuiltinRuntime } from '../host/builtin-runtime'
 registerBuiltinRuntime({
   "common/configPaths.ts": m0,
@@ -46,37 +29,20 @@ registerBuiltinRuntime({
   "common/instance.ts": m3,
   "common/logger.ts": m4,
   "common/platform.ts": m5,
-  "common/protocolErrors.ts": m6,
-  "common/utils/audio.ts": m7,
-  "common/utils/audioFormat.ts": m8,
-  "common/utils/environment.ts": m9,
-  "common/utils/ffmpeg.ts": m10,
-  "common/utils/file.ts": m11,
-  "common/utils/index.ts": m12,
-  "common/utils/misc.ts": m13,
-  "common/utils/musicCard.ts": m14,
-  "common/utils/port.ts": m15,
-  "common/utils/request.ts": m16,
-  "common/utils/sign.ts": m17,
-  "common/utils/video.ts": m18,
-  "main/config/index.ts": m19,
-  "main/config/legacyConfig.ts": m20,
-  "main/config/validate.ts": m21,
-  "main/log.ts": m22,
-  "native/index.ts": m23,
-  "plugin/host/index.ts": m24,
-  "plugin/host/manifest.ts": m25,
-  "plugin/host/resolve-hook.ts": m26,
-  "plugin/internal/adapter/adapterEntry.ts": m27,
-  "plugin/internal/adapter/onebot11/action/index.ts": m28,
-  "plugin/internal/adapter/onebot11/action/OB11Response.ts": m29,
-  "plugin/internal/adapter/settingsTemplate.ts": m30,
-  "plugin/internal/protocol/nt-protocol/ntqqapi/entities.ts": m31,
-  "plugin/internal/protocol/nt-protocol/ntqqapi/helper/face_config.json": m32,
-  "plugin/internal/protocol/nt-protocol/ntqqapi/helper/forwardMsg.ts": m33,
-  "plugin/internal/protocol/nt-protocol/ntqqapi/proto/index.ts": m34,
-  "plugin/internal/protocol/nt-protocol/ntqqapi/types/index.ts": m35,
-  "plugin/internal/protocol/nt-protocol/ntqqapi/types/msg.ts": m36,
-  "universal/fallback.ts": m37,
-  "version.ts": m38,
+  "common/utils/audio.ts": m6,
+  "common/utils/audioFormat.ts": m7,
+  "common/utils/environment.ts": m8,
+  "common/utils/port.ts": m9,
+  "main/config/index.ts": m10,
+  "main/config/legacyConfig.ts": m11,
+  "main/config/validate.ts": m12,
+  "main/log.ts": m13,
+  "plugin/host/index.ts": m14,
+  "plugin/host/manifest.ts": m15,
+  "plugin/host/resolve-hook.ts": m16,
+  "plugin/host/shared-packages.ts": m17,
+  "plugin/internal/adapter/adapterEntry.ts": m18,
+  "plugin/internal/adapter/settingsTemplate.ts": m19,
+  "universal/fallback.ts": m20,
+  "version.ts": m21,
 })

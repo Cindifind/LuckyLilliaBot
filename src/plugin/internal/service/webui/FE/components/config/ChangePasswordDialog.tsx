@@ -65,7 +65,7 @@ const ChangePasswordDialog: React.FC<ChangePasswordDialogProps> = ({ visible, on
         setError(response.message || '密码修改失败');
       }
     } catch (error) {
-      setError(error.message || '密码修改失败');
+      setError(error instanceof Error ? error.message : '密码修改失败');
     } finally {
       setLoading(false);
     }

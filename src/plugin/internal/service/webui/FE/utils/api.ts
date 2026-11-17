@@ -56,12 +56,10 @@ const refusedLogin = (response: Response) => response.headers.has('x-webui-auth'
  */
 export async function authorizedFetch(url: string, options: RequestInit = {}): Promise<Response> {
   const makeRequest = async (authToken: string | null): Promise<Response> => {
-    const headers: HeadersInit = {
-      ...options.headers,
-    };
+    const headers = new Headers(options.headers);
 
     if (authToken) {
-      headers['x-webui-token'] = authToken;
+      headers.set('x-webui-token', authToken);
     }
 
     return fetch(url, {

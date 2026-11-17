@@ -7,7 +7,7 @@ const DATA_DIR = mkdtempSync(path.join(tmpdir(), 'llbot-migrate-'))
 
 vi.mock('@/common/globalVars', () => ({ DATA_DIR }))
 
-const { liftBuiltinSettings, migrateToInstances, renameNativeQQSettings } = await import('@/main/config/migrate')
+const { liftBuiltinSettings, migrateToInstances, renameNativeQQSettings, migrateExtractedPlugins, migrateNTQQMessaging } = await import('@/main/config/migrate')
 
 const log = { info: vi.fn(), warn: vi.fn() }
 const at = (...parts: string[]) => path.join(DATA_DIR, ...parts)
@@ -172,16 +172,16 @@ describe('liftBuiltinSettings', () => {
     expect(read('instances', 'default', 'settings.json')).toEqual({ log: true })
     expect(entry('builtin:satori')).toMatchObject({ config: { host: '127.0.0.1', port: 5700, token: 't' } })
     expect(entry('builtin:satori').disabled).toBeUndefined()
-    expect(entry('builtin:milky')).toMatchObject({ disabled: true, config: { http: { port: 3011 } } })
-    expect(entry('builtin:onebot11').config.connect[0]).toMatchObject({ type: 'ws', enable: true, port: 3100 })
+    expect(entry('@luckylillia/plugin-milky')).toMatchObject({ disabled: true, config: { http: { port: 3011 } } })
+    expect(entry('@luckylillia/plugin-onebot11').config.connect[0]).toMatchObject({ type: 'ws', enable: true, port: 3100 })
   })
 
   it('moves email.json into its entry and keeps the file as .bak', () => {
     put('instances/default/email.json', { enabled: true, from: 'a@b.c' })
     put('instances/default/plugins.json', { version: 1, entries: [{ id: 'p0000001', name: 'p' }] })
     liftBuiltinSettings(log)
-    expect(entry('builtin:email-notification')).toMatchObject({ config: { from: 'a@b.c' } })
-    expect(entry('builtin:email-notification').disabled).toBeUndefined()
+    expect(entry('@luckylillia/plugin-ntqq-offline-email')).toMatchObject({ config: { from: 'a@b.c' } })
+    expect(entry('@luckylillia/plugin-ntqq-offline-email').disabled).toBeUndefined()
     expect(entry('p')).toEqual({ id: 'p0000001', name: 'p' })
     expect(existsSync(at('instances', 'default', 'email.json'))).toBe(false)
     expect(existsSync(at('instances', 'default', 'email.json.bak'))).toBe(true)
@@ -241,5 +241,134 @@ describe('renameNativeQQSettings', () => {
     put('instances/default/plugins.json', '{ broken')
     renameNativeQQSettings(log)
     expect(readFileSync(at('instances', 'default', 'plugins.json'), 'utf8')).toBe('{ broken')
+  })
+})
+
+describe('migrateNTQQMessaging', () => {
+  it('removes retired core entries and their layout references without changing protocol settings or trust', () => {
+    const protocol = { id: 'nt000001', name: '@luckylillia/plugin-nt-protocol', config: { autoLoginUin: '123' }, disabled: true }
+    put('instances/default/plugins.json', { version: 1, entries: [
+      { id: 'bridge', name: 'builtin:ntqq-universal' }, protocol, { id: 'other', name: 'some-plugin' },
+    ], retained: [{ id: 'retained', name: 'builtin:ntqq-universal' }], trusted: ['some-plugin'],
+    messageOrder: ['bridge', 'nt000001', 'other', 'retained'], ui: {
+      hidden: ['builtin:ntqq-universal|page|legacy', 'some-plugin|page|main'],
+      order: { 'builtin:ntqq-universal|page|legacy': 1, 'some-plugin|page|main': 2 },
+    } })
+    migrateNTQQMessaging(log)
+    expect(read('instances', 'default', 'plugins.json')).toEqual({ version: 1,
+      entries: [protocol, { id: 'other', name: 'some-plugin' }], retained: [], trusted: ['some-plugin'],
+      messageOrder: ['nt000001', 'other'], ui: { hidden: ['some-plugin|page|main'], order: { 'some-plugin|page|main': 2 } },
+    })
+    migrateNTQQMessaging(log)
+    expect(log.info).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not create or enable a protocol entry when retiring the only NTQQ messaging entry', () => {
+    put('instances/default/plugins.json', { version: 1, entries: [{ id: 'old', name: 'builtin:ntqq-universal' }] })
+    migrateNTQQMessaging(log)
+    expect(read('instances', 'default', 'plugins.json')).toEqual({ version: 1, entries: [] })
+  })
+
+  it.each([{}, { hidden: null, order: null }, { hidden: [null], order: [] }])('tolerates partial layout preferences: %j', ui => {
+    put('instances/default/plugins.json', { version: 1, entries: [null, {}, { id: 'old', name: 'builtin:ntqq-universal' }], ui })
+    expect(() => migrateNTQQMessaging(log)).not.toThrow()
+    expect(read('instances', 'default', 'plugins.json').entries).toEqual([null, {}])
+  })
+})
+
+describe('migrateExtractedPlugins', () => {
+  it('migrates WebQQ preferences, retained entries and slots without changing the entry switch or trust', () => {
+    put('instances/default/plugins.json', { version: 1, entries: [
+      { id: 'webqq', name: 'builtin:webqq', config: { autoHideSidebar: true, fullscreenButton: false } },
+    ], retained: [{ id: 'saved-webqq', name: 'builtin:webqq', disabled: true, config: { autoHideSidebar: false } }],
+    messageOrder: ['webqq'], ui: { hidden: ['builtin:webqq|page|webqq'], order: { 'builtin:webqq|page|webqq': 30 } } })
+    migrateExtractedPlugins(log)
+    const file = read('instances', 'default', 'plugins.json')
+    expect(file.entries[0]).toEqual({ id: 'webqq', name: '@luckylillia/plugin-webqq', config: { autoHideSidebar: true, fullscreenButton: false } })
+    expect(file.retained[0]).toMatchObject({ id: 'saved-webqq', name: '@luckylillia/plugin-webqq', disabled: true })
+    expect(file.trusted).toEqual([])
+    expect(file.messageOrder).toEqual(['webqq'])
+    expect(file.ui).toEqual({ hidden: ['@luckylillia/plugin-webqq|page|webqq'], order: { '@luckylillia/plugin-webqq|page|webqq': 30 } })
+    migrateExtractedPlugins(log)
+    expect(log.info).toHaveBeenCalledTimes(1)
+  })
+
+  it('migrates NTQQ offline email settings, secrets and retained entries without granting trust', () => {
+    const smtp = { host: 'smtp.example.com', port: 465, secure: true, auth: { user: 'bot', pass: 'preserved-secret' } }
+    put('instances/default/plugins.json', { version: 1, entries: [
+      { id: 'mail', name: 'builtin:email-notification', config: { smtp, from: 'a@b.c', to: 'd@e.f' }, scope: { platforms: ['ntqq'] } },
+    ], retained: [{ id: 'saved', name: 'builtin:email-notification', disabled: true, config: { smtp } }],
+    messageOrder: ['mail'], ui: { hidden: ['builtin:email-notification|page|email'], order: { 'builtin:email-notification|page|email': 13 } } })
+    migrateExtractedPlugins(log)
+    const file = read('instances', 'default', 'plugins.json')
+    expect(file.entries[0]).toEqual({ id: 'mail', name: '@luckylillia/plugin-ntqq-offline-email', config: { smtp, from: 'a@b.c', to: 'd@e.f' }, scope: { platforms: ['ntqq'] } })
+    expect(file.retained[0]).toMatchObject({ id: 'saved', name: '@luckylillia/plugin-ntqq-offline-email', disabled: true, config: { smtp } })
+    expect(file.trusted).toEqual([])
+    expect(file.messageOrder).toEqual(['mail'])
+    expect(file.ui).toEqual({ hidden: ['@luckylillia/plugin-ntqq-offline-email|page|email'], order: { '@luckylillia/plugin-ntqq-offline-email|page|email': 13 } })
+    migrateExtractedPlugins(log)
+    expect(log.info).toHaveBeenCalledTimes(1)
+  })
+
+  it('lifts legacy email.json into the existing email entry without losing its ID or password', () => {
+    put('instances/default/plugins.json', { version: 1, trusted: [], entries: [{ id: 'mail-id', name: 'builtin:email-notification', disabled: true }] })
+    put('instances/default/email.json', { enabled: true, smtp: { host: 'smtp.test', auth: { pass: 'secret' } }, from: 'a@b.c' })
+    liftBuiltinSettings(log)
+    migrateExtractedPlugins(log)
+    expect(read('instances', 'default', 'plugins.json')).toMatchObject({ trusted: [], entries: [
+      { id: 'mail-id', name: '@luckylillia/plugin-ntqq-offline-email', config: { smtp: { auth: { pass: 'secret' } }, from: 'a@b.c' } },
+    ] })
+    expect(read('instances', 'default', 'plugins.json').entries[0].disabled).toBeUndefined()
+  })
+
+  it('keeps entry identities, account settings, scope and UI positions without implicitly trusting the extracted packages', () => {
+    put('instances/default/plugins.json', { version: 1, entries: [
+      { id: 'nt000001', name: 'builtin:nt-protocol', config: { autoLoginUin: '123' }, disabled: true, scope: { platforms: ['ntqq'] } },
+      { id: 'external', name: 'third-party' },
+      { id: 'untrusted', name: 'disabled-third-party', disabled: true },
+    ], retained: [{ id: 'ob000001', name: 'builtin:onebot11', config: { port: 3001 } }],
+    messageOrder: ['nt000001', 'external'], ui: { hidden: ['builtin:nt-protocol|page|ntqq'], order: {
+      'builtin:onebot11|page|onebot11': 1, '@luckylillia/plugin-onebot11|page|onebot11': 2,
+    } } })
+    migrateExtractedPlugins(log)
+    const file = read('instances', 'default', 'plugins.json')
+    expect(file.entries[0]).toEqual({ id: 'nt000001', name: '@luckylillia/plugin-nt-protocol', config: { autoLoginUin: '123' }, disabled: true, scope: { platforms: ['ntqq'] } })
+    expect(file.retained[0]).toMatchObject({ id: 'ob000001', name: '@luckylillia/plugin-onebot11', config: { port: 3001 } })
+    expect(file.messageOrder).toEqual(['nt000001', 'external'])
+    expect(file.trusted).toEqual(['third-party'])
+    expect(file.ui).toEqual({ hidden: ['@luckylillia/plugin-nt-protocol|page|ntqq'], order: { '@luckylillia/plugin-onebot11|page|onebot11': 2 } })
+    migrateExtractedPlugins(log)
+    expect(log.info).toHaveBeenCalledTimes(1)
+  })
+
+  it('lifts new desktop settings into the existing builtin entry before renaming it', () => {
+    put('instances/default/plugins.json', { version: 1, entries: [{ id: 'old-id', name: 'builtin:onebot11', disabled: true, config: { connect: [] } }] })
+    put('instances/default/settings.json', { ob11: { enable: true, enableWs: true, wsPort: 3100 } })
+    liftBuiltinSettings(log)
+    migrateExtractedPlugins(log)
+    const entries = read('instances', 'default', 'plugins.json').entries
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({ id: 'old-id', name: '@luckylillia/plugin-onebot11' })
+    expect(entries[0].disabled).toBeUndefined()
+    expect(entries[0].config.connect[0]).toMatchObject({ type: 'ws', enable: true, port: 3100 })
+  })
+
+  it.each([{}, { hidden: ['builtin:nt-protocol|page|ntqq', null] }, { order: { 'builtin:nt-protocol|page|ntqq': 1 } }, { hidden: 'invalid', order: null }])('does not fail on partial UI preferences or unrelated invalid entries: %j', (ui) => {
+    put('instances/default/plugins.json', { version: 1, entries: [null, {}, 1, { id: 'nt', name: 'builtin:nt-protocol' }], retained: [null], ui })
+    expect(() => migrateExtractedPlugins(log)).not.toThrow()
+    expect(read('instances', 'default', 'plugins.json').entries).toEqual([null, {}, 1, { id: 'nt', name: '@luckylillia/plugin-nt-protocol' }])
+  })
+
+  it('keeps explicitly granted trust and separate old/new entries without deleting either configuration', () => {
+    put('instances/default/plugins.json', { version: 1, trusted: ['@luckylillia/plugin-milky'], entries: [
+      { id: 'old', name: 'builtin:milky', config: { port: 1 } },
+      { id: 'new', name: '@luckylillia/plugin-milky', config: { port: 2 } },
+    ] })
+    migrateExtractedPlugins(log)
+    expect(read('instances', 'default', 'plugins.json')).toMatchObject({ trusted: ['@luckylillia/plugin-milky'], entries: [
+      { id: 'old', name: '@luckylillia/plugin-milky', config: { port: 1 } },
+      { id: 'new', name: '@luckylillia/plugin-milky', config: { port: 2 } },
+    ] })
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('多个启用条目'))
   })
 })

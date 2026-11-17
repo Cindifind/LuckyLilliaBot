@@ -49,3 +49,4 @@ RUN touch /.dockerenv
 VOLUME ["/app/llbot/data"]
 
 ENTRYPOINT ["/startup.sh"]
+CMD []

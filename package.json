@@ -18,8 +18,8 @@
     "format": "prettier -cw .",
     "check": "tsc",
     "check:webui": "npm --prefix src/plugin/internal/service/webui/FE run check",
-    "test:webui": "vitest run --config vitest.config.ts 'test/webui'",
-    "test:unit": "vitest run --config vitest.config.ts 'test/unit'",
+    "test:webui": "vitest run --config vitest.config.ts test/webui",
+    "test:unit": "vitest run --config vitest.config.ts test/unit",
     "test": "vitest run --config vitest.config.ts"
   },
   "author": "",
@@ -46,7 +46,6 @@
     "hono": "^4.13.5",
     "image-size": "^2.0.2",
     "json5": "^2.2.3",
-    "nodemailer": "^9.1.1",
     "qrcode": "^1.5.4",
     "schemastery": "^3.18.0",
     "semver": "7.8.5",
@@ -59,7 +58,6 @@
   "devDependencies": {
     "@types/busboy": "^1.5.4",
     "@types/node": "^24.12.4",
-    "@types/nodemailer": "^8.0.1",
     "@types/qrcode": "^1.5.6",
     "@types/semver": "^7",
     "@types/ws": "^8.18.1",
