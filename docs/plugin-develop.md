@@ -47,6 +47,7 @@ export function apply(ctx) {
 这个示例直接使用 JavaScript，无需编译。SDK 由宿主提供，插件目录无需执行 `npm install`。若使用源码运行 Bot，环境准备见[准备仓库与 SDK](#准备仓库与-sdk)。
 
 1. 启动 Bot，在 WebUI「插件」的「本地安装」中，点击真实插件目录旁的「扫描」。
+   无头启动也可使用 `node llbot.js --plugin luckylillia-plugin-ping`：已有包直接信任并启用，缺少时从配置的 npm 源安装。参数可重复或用逗号分隔，并启用必需插件依赖；保留已有配置，详见[启动时安装并启用插件](plugin-system.md#启动时安装并启用插件)。
 2. 找到「Ping 示例」，完成信任确认并启用。
 3. 用另一个账号向已连接的 Bot 发送 `ping`，应收到 `pong`。官方机器人群聊中发送 `@机器人 ping`。
 
@@ -80,7 +81,7 @@ export function apply(ctx) {
 
 ## 插件能做什么
 
-以下是宿主和内置插件提供的常用能力；后端功能所需的服务要在 [inject 和清单](#声明服务依赖)中声明。
+以下是宿主、内置插件和已安装的协议插件提供的常用能力；后端功能所需的服务要在 [inject 和清单](#声明服务依赖)中声明。NTQQ 来自独立的 `@luckylillia/plugin-nt-protocol`，OneBot 11 和 Milky 分别来自 `@luckylillia/plugin-onebot11`、`@luckylillia/plugin-milky`，均需用户自行安装、信任和启用；Satori、QQ 官方机器人与 WebQQ 仍由 Bot 随附。没有安装 NTQQ 时，通用插件仍能处理其他已启用协议提供的 Bot。
 
 | 能力 | 调用入口 | 所需服务 |
 |---|---|---|
@@ -741,7 +742,7 @@ NTQQ 的 `platform` 为 `ntqq`，提供普通 QQ 身份；官方机器人的 `pl
 
 将 Session 或 Bot 返回的资源 ID 原样传给 Bot 方法；频道消息里的 `at`、`sharp`、`quote` 也使用对应的 ID。分页的 `next`、事件的 `referrer`、按钮 ID 和按钮数据都是不透明值，原样传回，不自行添加前缀。Satori 客户端同样只看到一个 `qq` login，频道消息通过这套资源 ID 区分。
 
-OneBot、Milky、Satori 是对外传输协议，多开一个连接不等于多登录一个 QQ。Satori 可把中立层多个 Bot 作为不同 login 提供给外部客户端。
+OneBot、Milky、Satori 是对外传输协议，多开一个连接不等于多登录一个 QQ。OneBot 11 和 Milky 是依赖 NTQQ 账号服务的独立插件；Satori 是宿主内置适配器，可把中立层多个 Bot 作为不同 login 提供给外部客户端。
 
 #### 消息与回复限制
 
@@ -797,7 +798,7 @@ if (internal && session.guildId && session.userId) {
 }
 ```
 
-NT internal 使用 OneBot 11 action，含 go-cqhttp/LLOneBot 扩展。名称转为驼峰，`set_group_card` 对应 `setGroupCard`，`_send_group_notice` 对应 `sendGroupNotice`；参数仍是一个 OneBot 字段对象。返回 action 的 data，失败抛异常。消息 ID 参数可接收 `session.messageId`，但 OneBot 响应中的 message_id 仍可能是数字。无需开启 OneBot 对外适配器。
+NT internal 使用 NTQQ 插件提供的 OneBot 11 账号 action，含 go-cqhttp/LLOneBot 扩展。名称转为驼峰，`set_group_card` 对应 `setGroupCard`，`_send_group_notice` 对应 `sendGroupNotice`；参数仍是一个 OneBot 字段对象。返回 action 的 data，失败抛异常。消息 ID 参数可接收 `session.messageId`，但 OneBot 响应中的 message_id 仍可能是数字。需要已启用并登录的 NTQQ 协议，不需要安装或开启 OneBot 对外传输插件；普通插件使用 SDK 的 `internalOf()`，不要引用协议仓库的私有 action 文件。
 
 下面列出常用入口。代码中使用驼峰方法名，全部接口和参数见 [SDK internal](../packages/plugin-sdk/src/internal.ts)。
 
@@ -1098,6 +1099,38 @@ export default function apply(ctx: WebUIContext) {
 
 `FieldProps` 还提供 `meta`，包含 `description`、`default`、`role` 选项等。控件会影响所有使用该 `role` 的字段，命名应明确；内置的 `ms`、`table`、`radio`、`checkbox`、`secret`、`slider`、`textarea`、`host` 不能被覆盖。
 
+### 主题与受管样式
+
+主题也是第三方插件：`llbot.category` 写 `theme`，用 `llbot.webui` 指向浏览器入口，后端可以只是空的 `apply()`，不需要依赖 QQ。完整的免构建示例在 `test/fixtures/plugins/theme/`，包含两套主题、亮暗配色、背景图片和界面扩展。
+
+```js
+export default function apply(ctx) {
+  ctx.theme.register({
+    id: 'ocean', title: '海洋', description: '青蓝色界面',
+    light: { tokens: { '--accent': '#0891b2', '--r-card': '12px' }, background: '#e8f7ff' },
+    dark: { tokens: { '--accent': '#38bdf8', '--r-card': '12px' }, background: '#102030' },
+  })
+}
+```
+
+用户在「页面设置 → 主题与外观」选择主题，亮色、暗色、跟随系统独立控制。主题完整键为 `<包名>|<id>`，选择与模式保存在当前浏览器的 `llbot-theme` 中，兼容原来只有 `mode` 的记录。插件尚在加载、停用、失败或卸载时立即回退默认主题，保留选择，重新启用后恢复。同包存在多个实例时，只要有一个实例运行就生效。
+
+`tokens` 是 CSS 自定义属性表，两种模式均需提供（可以为空）。优先使用宿主语义变量：`--accent` / `--accent-strong` / `--accent-from` / `--accent-to` / `--accent-soft`、`--text-primary` / `--text-secondary` / `--text-muted` / `--text-hint`、`--r-card` / `--r-panel` / `--r-control`、`--font-ui`、`--glass-tint`（RGB 三元组）、`--glass-alpha-card` / `--glass-alpha-regular` / `--glass-blur-regular`。全部变量见 WebUI 的 `styles/tokens.css`。未覆盖的变量继续使用宿主值；令牌同时作用于根节点、portal 弹框和玻璃材质的亮暗局部区域。
+
+`background` 是 CSS background 简写，可用渐变、纯色或 `url()`。填写后替换默认动态壁纸，玻璃材质使用当前亮暗模式；不填则继续使用宿主的动态背景和亮度采样。图片可用 `ctx.asset('images/wallpaper.webp')`，相对于入口模块所在目录解析，不能越出该目录。文件须包含在 npm 包中，由已登录的 `/plugin-webui` 路由提供。
+
+需要更大幅度改外观时，定义可带 `css` 字符串，只在选中该主题且插件运行时安装。根节点的 `data-llbot-theme` 是实际生效主题键，可用于限定选择器。组件自己的样式用 `ctx.style('组件样式ID', css)` 注册：随插件运行状态安装或移除，不随主题选择改变；同 ID 更新替换上一份，旧的清理函数不会误删新样式。宿主不扫描插件的任意 Tailwind 类，也不自动限定 CSS 选择器，普通组件样式请自行使用类名前缀。
+
+对于 Tailwind 等通用工具类，使用 `ctx.style('utilities', css, { scope: 'plugin', when: 'loaded' })`：宿主用 CSS `@scope` 限制到本插件的组件，不会让 `.flex`、`.grid-cols-1` 覆盖外壳的响应式规则。宿主为组件提供 `data-plugin-ui` 根节点，import map 的 `react-dom.createPortal` 也会带上同一作用域；默认 `:root,:host` 的工具类令牌转换为局部 `:scope`。`when: 'loaded'` 仅允许搭配插件作用域，用于停用时仍需显示的配置页面，模块卸载后才撤销。普通全局受管样式默认 `when: 'active'`，随停用立即撤销。需要浏览器支持 CSS `@scope`。
+
+`ctx.theme.overrideTokens('覆盖层ID', { light: {...}, dark: {...} })` 提供可撤销的全局令牌覆盖层：运行中的插件按注册顺序覆盖，后注册者优先，删除后恢复下层。同插件的同 ID 替换旧层。它独立于主题选择，因此只想随某个主题使用的颜色应写在主题定义里。
+
+以上注册方法均返回 disposer，模块卸载、替换或 apply 抛错时也由宿主统一清理。不要用模块顶层插入 `<style>` 改主题：停用插件时宿主可能保留模块供配置页面使用，只有受管样式才会立即撤销。
+
+组件从 SDK 调用 `useTheme()` 获取响应式 `{ mode, isDark, selected, active, background, themes, select, setMode }`；`select(key)` 使用完整主题键或 `default`，`setMode()` 接受 `light` / `dark` / `auto`。入口可用 `ctx.theme.get()` 取快照，`ctx.theme.select(id)` 选择本插件的主题或 `default`，通常应交给用户在设置页选择。
+
+主题的专属选项注册到 `settings.appearance`，无需另建设置页或侧边栏条目。宿主只显示当前生效主题所属插件的贡献，统一包在默认折叠的「主题设置」中，切换主题后重新折叠。未注册选项或组件返回 `null` 时不显示该折叠项。主题选择和亮暗切换由 WebUI「页面设置 → 主题与外观」提供，不必重复实现。
+
 ### 插槽
 
 插槽是界面所有者显式开放的扩展位置。插件可以往插槽中注册组件，称为一项「贡献」。例如，下面的入口为 Dashboard 增加一张账号状态卡片：
@@ -1130,9 +1163,15 @@ export default function apply(ctx) {
 | `single` | 只显示优先级最高者，无贡献时显示默认内容 | `priority` 大的优先 |
 | `keyed` | 为当前渲染的键选择一个贡献 | `match` 指定键，`priority` 决定优先级 |
 | `chain` | 层层包装，排前面的在外层 | 按 `order` 排序，组件接收 `next` |
+| `hoc` | 层层包装，排前面的在外层，报错时透传内部内容 | 按 `order` 排序，组件接收 `children`；可用 `match` 限定页面键 |
 
 | 插槽 | 基数 | 组件收到的 props | 选项及外框 |
 |---|---|---|---|
+| `sidebar.header` / `sidebar.footer` | `list` | 无 | 侧边栏顶部 / 账号卡上方 |
+| `page.header.actions` | `list` | `{ page: { key, owner, title, fullscreen } }` | 桌面标题右侧、移动端顶栏；全屏页面不绘制顶栏 |
+| `page.content` | `hoc` | `{ page, children }` | 页面外框，可用 `match` 指定页面键；核心锁定页面不参与 |
+| `settings.appearance` | `list` | 无 | 当前生效主题所属插件的专属选项；默认折叠的「主题设置」，无内容时隐藏 |
+| `settings.sections` | `list` | 无 | 页面设置的附加卡片，选项 `title` 由宿主绘制 |
 | `plugins.toolbar` | `list` | 无 | 统一插件页筛选栏的附加工具按钮 |
 | `plugins.views` | `list` | `PluginsViewProps`：`{ configAction, showDetails }` | 必需 `title`，以紧凑工具按钮打开独立视图，可返回统一列表 |
 | `plugins.catalog` | `list` | `PluginCatalogProps`：`{ loadCatalog, onChange }` | 提供目录数据和包操作，组件不绘制界面 |
@@ -1506,6 +1545,7 @@ my-plugin/
 | `chat` | 消息互动 | 自动回复、复读、游戏 |
 | `tool` | 工具 | 通知、黑名单、独立工具 |
 | `service` | 依赖组件 | 为其它插件提供共享服务 |
+| `theme` | 主题 | WebUI 配色、背景和界面样式 |
 | `other` | 其他 | 其它或未指定分类 |
 
 分类按表中顺序显示。未知值记录警告并归入「其他」，插件仍可加载。
@@ -1601,7 +1641,7 @@ npm pack --dry-run
 默认市场从 npm 包 `@luckylillia/market` 读取目录。要让插件出现在 Bot 的市场中：
 
 1. 完成[产物检查](#检查发布产物)，将插件发布到 npm。
-2. 到 [LuckyLillia.Market](https://github.com/LuckyLilliaDev/LuckyLillia.Market) 创建「注册插件」Issue，提交 npm 包名并选择插件分类。分类选项与上文 `llbot.category` 的六个值一致；目录按登记选择保存 `category`，自动更新版本时保留，建议与包内声明保持一致。登记检查会从发布包读取 `llbot`、标题、简介、作者和公开 GitHub 仓库地址。
+2. 到 [LuckyLillia.Market](https://github.com/LuckyLilliaDev/LuckyLillia.Market) 创建「注册插件」Issue，提交 npm 包名并选择插件分类。分类选项与上文 `llbot.category` 的七个值一致；目录按登记选择保存 `category`，自动更新版本时保留，建议与包内声明保持一致。登记检查会从发布包读取 `llbot`、标题、简介、作者和公开 GitHub 仓库地址。
 3. 检查通过后生成登记 PR。维护者合并并发布目录包后，用户才能在 Bot 市场中搜索到插件。
 
 目录的 `plugins.json` 统一保存展示信息和通过检查的精确版本，每个插件条目的 `version` 必须是完整版本号，不能填写 `latest` 或版本范围。Bot 不再读取旧的 `versions.json`。更新插件时也要推进目录版本；只发布新的 npm 版本不会让 Bot 提示更新。
@@ -1664,7 +1704,7 @@ npm pack --dry-run
 
 已安装且有配置入口的条目直接在统一卡片中打开设置。停用的第三方插件也能配置，无需先启用；同包多个实例分别保留各自卡片，齿轮打开对应条目的配置。尚未安装或没有本地条目的包不显示设置入口。
 
-Bot 随附的官方内置插件也有独立的 npm 包名和版本，参与同一套检查更新。它们更新后需要重启 Bot，界面显示已下载版本及当前运行版本；原有条目和配置保留，不能卸载或用本地压缩包覆盖。普通插件不应使用内置包的保留名称或声明 `llbot.builtin`。
+Bot 随附的官方内置插件也有独立的 npm 包名和版本，参与同一套检查更新。它们更新后需要重启 Bot，界面显示已下载版本及当前运行版本；原有条目和配置保留，不能卸载或用本地压缩包覆盖。普通插件不应使用内置包的保留名称或声明 `llbot.builtin`。NTQQ、OneBot 11 和 Milky 已提取为普通插件，使用正常安装、更新、重载和卸载流程，不属于此内置更新规则；相关源码位于各自仓库，包是否已发布应以 npm / 市场目录为准。
 
 插件从目录移除后，已安装的包会保留，卡片不再显示不在市场目录中的常规提示；兼容性问题、请求失败和更新未加载等实际错误仍保留。点击卸载会打开独立确认弹框，默认勾选「保留配置」；确认后删除插件文件并从已安装列表移除全部条目。保留时，重新安装会恢复各条目的配置和生效范围，全部保持停用，启用需重新信任；取消勾选则删除配置。两种选择都会清除信任、消息处理顺序和界面布局偏好，保留插件数据目录；取消弹框不发卸载请求。
 
