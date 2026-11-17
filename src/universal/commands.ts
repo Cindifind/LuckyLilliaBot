@@ -420,7 +420,8 @@ export class CommandService extends Service implements Commands {
 
   /** Puts the commands on a bot's menu, unless it has these already. */
   private syncMenu(bot: Bot) {
-    if (!bot.updateCommands) return
+    // QQ menus and panels are managed explicitly, independently of the local command registry.
+    if (bot.platform === 'qq' || !bot.updateCommands) return
     const menu = this.menu()
     const key = JSON.stringify(menu)
     if (this.menus.get(bot.sid) === key) return
