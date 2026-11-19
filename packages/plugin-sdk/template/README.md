@@ -2,7 +2,7 @@
 
 {{description}}
 
-一个 LuckyLillia Bot 插件。写法见 LuckyLillia Bot 仓库的 `docs/plugin-authoring.md`。
+一个 LuckyLillia Bot 插件。写法见[插件开发指南](https://github.com/LuckyLilliaDev/LuckyLilliaBot/tree/main/docs)。
 
 ## 开发
 

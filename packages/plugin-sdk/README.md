@@ -74,7 +74,7 @@ ctx.on('bot/message', async (session, next) => {
 })
 ```
 
-`bot/message` 是中间件链（不调 `next()` 就拦下这条消息），其它事件走 `bot/event`，发送前可以用 `bot/before-send` 改写。完整说明见仓库内 `docs/plugin-authoring.md`。
+`bot/message` 是中间件链（不调 `next()` 就拦下这条消息），其它事件走 `bot/event`，发送前可以用 `bot/before-send` 改写。完整说明见[插件开发指南](https://github.com/LuckyLilliaDev/LuckyLilliaBot/tree/main/docs)。
 
 NTQQ 账号的 `session.platform` / `bot.platform` 是 `ntqq`，`bot.sid` 是 `ntqq:<QQ号>`；QQ 官方机器人使用 `qq`。调用 NTQQ 专属接口时可用 `internalOf(session.bot, 'ntqq')` 获得 `NTQQInternal` 类型。
 
