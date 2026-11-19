@@ -71,6 +71,29 @@ describe('unified plugin list', () => {
     expect(filterPluginItems(items, { ...filters, installation: 'uninstalled' })).toEqual([])
   })
 
+  it('updates toggle state in place and sorts by the latest state on a new visit', () => {
+    const alpha = plugin('alpha')
+    const beta = plugin('beta', { disabled: true, state: 'disposed' })
+    const order = mergePluginItems([beta, alpha], []).map(item => item.key)
+    const updated = [
+      { ...beta, disabled: false, state: 'active' as const },
+      { ...alpha, disabled: true, state: 'disposed' as const },
+    ]
+    const items = mergePluginItems(updated, [], order)
+    expect(items.map(itemName)).toEqual(['alpha', 'beta'])
+    expect(filterPluginItems(items, { ...filters, status: 'enabled' }).map(itemName)).toEqual(['beta'])
+    expect(filterPluginItems(items, { ...filters, status: 'disabled' }).map(itemName)).toEqual(['alpha'])
+    expect(mergePluginItems(updated, []).map(itemName)).toEqual(['beta', 'alpha'])
+  })
+
+  it('keeps existing positions when entries disappear or arrive during a visit', () => {
+    const alpha = plugin('alpha')
+    const beta = plugin('beta', { disabled: true })
+    const order = mergePluginItems([alpha, beta, plugin('removed')], []).map(item => item.key)
+    const items = mergePluginItems([plugin('new'), { ...beta, disabled: false }, { ...alpha, disabled: true }], [], order)
+    expect(items.map(itemName)).toEqual(['alpha', 'beta', 'new'])
+  })
+
   it('keeps an installed package without an entry and appends only uninstalled catalog packages', () => {
     const pkg = installed('broken', { error: 'missing entry point' })
     const market = source({ installed: [pkg], items: [entry('broken'), entry('new-plugin')] })

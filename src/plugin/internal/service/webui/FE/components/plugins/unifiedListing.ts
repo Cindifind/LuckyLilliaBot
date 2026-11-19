@@ -23,8 +23,8 @@ export const itemCategory = (item: PluginListItem): CategoryKey => {
   return CATEGORIES.find(category => category.key === value)?.key ?? 'other'
 }
 
-/** Retain local and multi-instance entries; append only catalog packages not already installed. */
-export function mergePluginItems(plugins: PluginStatus[], sources: CatalogSource[]): PluginListItem[] {
+/** Merge current plugin data and preserve the order of cards already shown on this visit. */
+export function mergePluginItems(plugins: PluginStatus[], sources: CatalogSource[], itemOrder: readonly string[] = []): PluginListItem[] {
   const catalog = new Map<string, { entry: PluginCatalogItem; source: CatalogSource }>()
   const packages = new Map<string, { pkg: PluginInstalledPackage; source: CatalogSource }>()
   for (const source of sources) {
@@ -49,10 +49,20 @@ export function mergePluginItems(plugins: PluginStatus[], sources: CatalogSource
   for (const [name, { entry, source }] of catalog) {
     if (!seen.has(name)) items.push({ key: `catalog:${name}`, catalog: entry, source })
   }
+  const remaining = new Map(items.map(item => [item.key, item]))
+  const ordered: PluginListItem[] = []
+  for (const key of itemOrder) {
+    const item = remaining.get(key)
+    if (!item) continue
+    ordered.push(item)
+    remaining.delete(key)
+  }
+
   const rank = (item: PluginListItem) => CATEGORIES.findIndex(category => category.key === itemCategory(item))
   const enabled = (item: PluginListItem) => !!item.plugin && !item.plugin.disabled
-  return items.sort((a, b) => Number(enabled(b)) - Number(enabled(a)) || rank(a) - rank(b) || Number(itemBuiltin(b)) - Number(itemBuiltin(a))
+  const added = [...remaining.values()].sort((a, b) => Number(enabled(b)) - Number(enabled(a)) || rank(a) - rank(b) || Number(itemBuiltin(b)) - Number(itemBuiltin(a))
     || Number(isInstalled(b)) - Number(isInstalled(a)) || itemName(a).localeCompare(itemName(b)) || a.key.localeCompare(b.key))
+  return ordered.concat(added)
 }
 
 export interface PluginFilters {

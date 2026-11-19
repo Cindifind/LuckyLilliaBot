@@ -62,7 +62,16 @@ const PluginsPage: React.FC = () => {
   useEffect(() => { sessionStorage.setItem(VIEW_KEY, JSON.stringify(view)) }, [view])
   const update = (patch: Partial<View>) => setView(previous => ({ ...previous, page: 1, ...patch }))
 
-  const allItems = useMemo(() => mergePluginItems(plugins ?? [], catalog.sources), [plugins, catalog.sources])
+  const added = useSlotContents('plugins.views')
+  const addedView = added.find(c => contributionKey(c) === view.mode)
+  const mode = addedView ? view.mode : 'list'
+  const [itemOrder, setItemOrder] = useState<string[]>([])
+  const allItems = useMemo(() => mergePluginItems(plugins ?? [], catalog.sources, itemOrder), [plugins, catalog.sources, itemOrder])
+  // Remember card positions for this visit while keeping each card's status live.
+  const nextItemOrder = mode === 'list' && plugins !== null ? allItems.map(item => item.key) : []
+  if (nextItemOrder.length !== itemOrder.length || nextItemOrder.some((key, index) => key !== itemOrder[index])) {
+    setItemOrder(nextItemOrder)
+  }
   const matching = filterPluginItems(allItems, { ...view, category: 'all' })
   const shown = view.category === 'all' ? matching : matching.filter(item => itemCategory(item) === view.category)
   const counts = new Map(CATEGORIES.map(category => [category.key, matching.filter(item => itemCategory(item) === category.key).length]))
@@ -82,9 +91,6 @@ const PluginsPage: React.FC = () => {
     return result
   }, [plugins])
   const filtered = view.status !== 'all' || view.origin !== 'all' || !!view.search.trim() || view.category !== 'all' || view.updatesOnly
-  const added = useSlotContents('plugins.views')
-  const addedView = added.find(c => contributionKey(c) === view.mode)
-  const mode = addedView ? view.mode : 'list'
   const titleOf = (c: (typeof added)[number]) => String(c.options.title ?? c.label ?? c.id)
 
   const withBusy = async (id: string, task: () => Promise<void>) => {
