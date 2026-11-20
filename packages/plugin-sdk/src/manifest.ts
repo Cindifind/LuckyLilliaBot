@@ -5,15 +5,16 @@
  * - `chat` 消息互动: answers messages (auto replies, games)
  * - `tool` 工具: anything else users switch on for itself (WebQQ, notifications, blocklists)
  * - `service` 依赖组件: provides services other plugins need (databases, renderers)
+ * - `theme` 主题: WebUI palettes, wallpapers and appearance
  * - `other` 其他: the rest, and plugins that declare none
  */
-export type PluginCategory = 'protocol' | 'adapter' | 'chat' | 'tool' | 'service' | 'other'
+export type PluginCategory = 'protocol' | 'adapter' | 'chat' | 'tool' | 'service' | 'theme' | 'other'
 
 /** The `llbot` field of a plugin's package.json. Its presence is what marks a package as a plugin. */
 export interface LLBotManifest {
   /** Its name in the WebUI, e.g. `关键词回复`; the package name without `luckylillia-plugin-` otherwise. Like `description`. */
   title?: string | Record<string, string>
-  /** Plain text, or a map keyed by locale such as `zh` / `en`. */
+  /** A description string, e.g. `自动回复消息`; also accepts a map keyed by locale such as `zh` / `en`. */
   description?: string | Record<string, string>
   /** Where the WebUI plugin page lists it; any other value counts as `other`. */
   category?: PluginCategory

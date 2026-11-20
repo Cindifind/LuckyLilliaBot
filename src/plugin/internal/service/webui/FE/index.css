@@ -312,6 +312,23 @@
     transform: scale(0.97);
   }
 
+  @media (width < 40rem) {
+    .btn-primary,
+    .btn-glass {
+      min-height: 2rem;
+      padding: 0.375rem 0.625rem;
+      font-size: 0.8125rem;
+      line-height: 1.25rem;
+    }
+
+    .btn-primary > svg,
+    .btn-glass > svg {
+      width: 0.875rem;
+      height: 0.875rem;
+      flex-shrink: 0;
+    }
+  }
+
   /*
    * Text fields. Recessed rather than raised: the inner shadow reads as a
    * well cut into the glass, which is how iOS 26 draws inputs.
@@ -477,6 +494,20 @@
 }
 
 @layer utilities {
+  /* A theme may register the slot but render null for its current variant.
+     Ignore empty PluginSurface roots too, so an empty disclosure stays hidden. */
+  .theme-settings:not(:has(> .theme-settings-body > :not(:empty))) {
+    display: none;
+  }
+
+  .theme-settings > summary {
+    list-style: none;
+  }
+
+  .theme-settings > summary::-webkit-details-marker {
+    display: none;
+  }
+
   /* The WebUI's frame around a slot contribution goes with it when it renders nothing; a utility, to beat .flex */
   .slot-frame:has(> .slot-body:empty) {
     display: none;

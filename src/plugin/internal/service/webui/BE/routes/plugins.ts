@@ -53,6 +53,7 @@ export function createPluginRoutes(ctx: Context): Hono {
   }))
 
   router.post('/scan', c => respond(c, () => ctx.plugins.scan()))
+  router.get('/directories', c => respond(c, () => ({ roots: ctx.plugins.config.roots.map(root => path.resolve(root)) })))
 
   router.get('/ui', c => respond(c, () => ctx.plugins.uiPrefs()))
   router.patch('/ui', async (c) => {
@@ -71,6 +72,24 @@ export function createPluginRoutes(ctx: Context): Hono {
   })
 
   router.delete('/:id', c => respond(c, () => ctx.plugins.remove(c.req.param('id'))))
+  router.post('/:id/uninstall', c => respond(c, async () => {
+    const body = await c.req.json<{ keepConfig?: boolean }>()
+    if (typeof body?.keepConfig !== 'boolean') {
+      throw new PluginConfigError([{ path: ['keepConfig'], message: 'keepConfig must be a boolean' }])
+    }
+    const entry = ctx.plugins.get(c.req.param('id'))
+    return ctx.plugins.uninstallPackage(entry.name, { keepConfig: body.keepConfig })
+  }))
+  router.post('/:id/remove-missing', c => respond(c, async () => {
+    const body = await c.req.json<{ keepConfig?: boolean }>().catch(() => ({} as { keepConfig?: boolean }))
+    if (body?.keepConfig !== undefined && typeof body.keepConfig !== 'boolean') {
+      throw new PluginConfigError([{ path: ['keepConfig'], message: 'keepConfig must be a boolean' }])
+    }
+    // This only removes entries in the current instance; no market service or package write is needed.
+    await ctx.plugins.scan()
+    const entry = ctx.plugins.get(c.req.param('id'))
+    return { removed: await ctx.plugins.removePackage(entry.name, { keepConfig: body?.keepConfig === true, missingOnly: true }) }
+  }))
   router.post('/:id/enable', async (c) => {
     const body = await c.req.json<{ trust?: boolean }>().catch(() => ({} as { trust?: boolean }))
     return respond(c, () => ctx.plugins.enable(c.req.param('id'), { trust: body?.trust === true }))

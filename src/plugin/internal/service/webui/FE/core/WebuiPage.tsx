@@ -6,6 +6,8 @@ import WebuiSettings from '../components/config/WebuiSettings'
 import { useThemeStore } from '../stores/themeStore'
 import { tokenCookieName } from '../utils/api'
 import { deleteCookie } from '../utils/cookie'
+import ThemeSettings from '../components/config/ThemeSettings'
+import { SlotOutlet } from '../plugin-host/views'
 
 const themeOptions = [
   { value: 'light' as const, label: '亮色', icon: Sun },
@@ -52,7 +54,8 @@ const WebuiPage: React.FC = () => {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="flex flex-col gap-6">
           <section className="card p-6" aria-labelledby="webui-theme-heading">
-            <h3 id="webui-theme-heading" className="text-base font-semibold text-theme mb-4">主题模式</h3>
+            <h3 id="webui-theme-heading" className="text-base font-semibold text-theme mb-4">主题与外观</h3>
+            <ThemeSettings />
             <div className="grid grid-cols-3 gap-3">
               {themeOptions.map(({ value, label, icon: Icon }) => {
                 const selected = mode === value
@@ -62,8 +65,9 @@ const WebuiPage: React.FC = () => {
                     type="button"
                     aria-pressed={selected}
                     onClick={() => setMode(value)}
+                    style={selected ? { borderColor: 'var(--accent)', background: 'var(--accent-soft)' } : undefined}
                     className={`flex flex-col items-center gap-2 px-2 py-4 rounded-xl border-2 transition-colors ${selected
-                      ? 'border-pink-500 bg-pink-50 dark:bg-pink-900/20'
+                      ? 'border-pink-500'
                       : 'border-theme-divider hover:border-theme-muted hover:bg-theme-item'}`}
                   >
                     <Icon size={24} className={selected ? 'text-pink-500' : 'text-theme-muted'} />
@@ -87,6 +91,13 @@ const WebuiPage: React.FC = () => {
           <WebuiSettings />
         </section>
       </div>
+
+      <SlotOutlet name="settings.sections" wrap={(element, contribution) => (
+        <section className="card p-6">
+          {typeof contribution.options.title === 'string' && <h3 className="text-base font-semibold text-theme mb-4">{contribution.options.title}</h3>}
+          {element}
+        </section>
+      )} />
 
       {confirmLogout && (
         <Portal>

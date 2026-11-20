@@ -10,34 +10,13 @@ import { afterAll, describe, expect, it, vi } from 'vitest'
 import { Config as LLBotConfig } from '@/common/types'
 import { DATA_DIR } from '@/common/globalVars'
 import { adapterDefaults, defaultConfig } from '@/main/config/defaultConfig'
-import {
-  NTFileApi,
-  NTFriendApi,
-  NTGroupApi,
-  NTLoginApi,
-  NTMsgApi,
-  NTSystemApi,
-  NTUserApi,
-  NTWebApi,
-} from '@/plugin/internal/protocol/nt-protocol/ntqqapi/api'
-import Core from '@/plugin/internal/protocol/nt-protocol/ntqqapi/core'
-import Store from '@/plugin/internal/protocol/nt-protocol/store'
-import OneBot11Adapter from '@/plugin/internal/adapter/onebot11/adapter'
 import SatoriAdapter from '@/plugin/internal/adapter/satori/adapter'
-import MilkyAdapter from '@/plugin/internal/adapter/milky/adapter'
 import { WebuiServer } from '@/plugin/internal/service/webui/BE/server'
-import { EmailRoutes } from '@/plugin/internal/tool/email-notification/testRoutes'
-import { NTLoginRoutes } from '@/plugin/internal/protocol/nt-protocol/loginRoutes'
-import { LoginInfoRoutes } from '@/plugin/internal/protocol/nt-protocol/loginInfoRoutes'
 import { Dashboard } from '@/plugin/internal/tool/dashboard'
 import { Logs } from '@/plugin/internal/tool/logs'
-import { WebQQ } from '@/plugin/internal/tool/webqq'
-import EmailNotificationService from '@/plugin/internal/tool/email-notification'
 import BotsService from '@/universal/bots'
-import * as NTQQUniversal from '@/plugin/internal/service/ntqq-universal'
 
-// The global setup points DATA_DIR at /tmp/test-data, which on Windows lands outside the repo.
-// Services here really write (email config, webqq upload dir, sqlite), so use a private temp dir.
+// These host services write sqlite and temporary files, so never use a real instance directory.
 vi.mock('@/common/globalVars', async () => {
   const fs = await import('node:fs')
   const os = await import('node:os')
@@ -52,34 +31,13 @@ vi.mock('@/common/globalVars', async () => {
   }
 })
 
-const config: LLBotConfig = {
-  ...defaultConfig,
-  ob11: { enable: false, connect: [] },
-  webui: { ...defaultConfig.webui, enable: false },
-}
+const config: LLBotConfig = { ...defaultConfig, webui: { ...defaultConfig.webui, enable: false } }
 
 class MockConfig extends Service {
-  constructor(ctx: Context) {
-    super(ctx, 'config')
-  }
-  get() {
-    return config
-  }
+  constructor(ctx: Context) { super(ctx, 'config') }
+  get() { return config }
   set() {}
   listenChange() {}
-}
-
-class MockProtocol extends Service {
-  // Logged in already
-  selfInfo = { uid: 'test-uid', uin: '123456', nick: 'TestBot', online: true }
-
-  constructor(ctx: Context) {
-    super(ctx, 'qqProtocol')
-  }
-  onDisconnect() {
-    return 'mock-disconnect'
-  }
-  offDisconnect() {}
 }
 
 const dbDir = mkdtempSync(path.join(os.tmpdir(), 'llbot-registry-db-'))
@@ -90,62 +48,39 @@ afterAll(() => {
 })
 
 describe('service registry under the pinned cordis version', () => {
-  it('brings every built-in service to ACTIVE', async () => {
+  it('starts the host without an NT package and leaves account-dependent consumers waiting', async () => {
     const ctx = new Context()
     const fibers: Record<string, Fiber> = {}
-    const mount = (name: string, plugin: any, cfg?: unknown) => {
-      fibers[name] = ctx.plugin(plugin, cfg)
+    const mount = (name: string, plugin: any, cfg?: unknown) => { fibers[name] = ctx.plugin(plugin, cfg) }
+    try {
+      mount('timer', TimerService)
+      mount('config', MockConfig)
+      mount('bots', BotsService)
+      mount('database', Database)
+      mount('sqlite', SQLiteDriver, { path: pathToFileURL(path.join(dbDir, 'registry.db')).href })
+      mount('satori', SatoriAdapter, { ...adapterDefaults.satori, enable: false })
+      mount('webuiServer', WebuiServer)
+      mount('dashboard', Dashboard)
+      mount('logs', Logs)
+      // Their inject lists are intentionally unsatisfied until the external protocol is installed and logged in.
+      const waiting = new Set<string>()
+      await vi.waitFor(() => {
+        const stuck = Object.entries(fibers)
+          .filter(([name, fiber]) => !waiting.has(name) && fiber.state !== FiberState.ACTIVE)
+          .map(([name, fiber]) => name + '=' + FiberState[fiber.state])
+        expect(stuck).toEqual([])
+      }, { timeout: 4_000, interval: 100 })
+      for (const name of waiting) expect(fibers[name].state, name).toBe(FiberState.PENDING)
+      for (const name of ['config', 'bots', 'timer', 'database', 'model', 'satori', 'webuiServer']) {
+        expect(ctx.get(name), name).toBeDefined()
+      }
+      for (const name of [
+        'qqProtocol', 'store', 'app', 'ntOnebot', 'ntFileApi', 'ntFriendApi', 'ntGroupApi', 'ntLoginApi',
+        'ntMsgApi', 'ntUserApi', 'ntWebApi', 'ntSystemApi', 'onebot', 'milky', 'emailNotification',
+      ]) expect(ctx.get(name), name).toBeUndefined()
+      expect(ctx.bots.size).toBe(0)
+    } finally {
+      for (const fiber of Object.values(fibers).reverse()) await fiber.dispose()
     }
-
-    mount('timer', TimerService)
-    mount('config', MockConfig)
-    mount('qqProtocol', MockProtocol)
-    mount('bots', BotsService)
-    mount('ntFileApi', NTFileApi)
-    mount('ntFriendApi', NTFriendApi)
-    mount('ntGroupApi', NTGroupApi)
-    mount('ntLoginApi', NTLoginApi)
-    mount('ntMsgApi', NTMsgApi)
-    mount('ntUserApi', NTUserApi)
-    mount('ntWebApi', NTWebApi)
-    mount('ntSystemApi', NTSystemApi)
-    mount('database', Database)
-    mount('sqlite', SQLiteDriver, { path: pathToFileURL(path.join(dbDir, 'registry.db')).href })
-    mount('app', Core, config)
-    mount('onebot', OneBot11Adapter, {
-      ...adapterDefaults.ob11,
-      musicCardSignUrl: config.musicCardSignUrl,
-      ffmpeg: config.ffmpeg,
-    })
-    mount('satori', SatoriAdapter, { ...adapterDefaults.satori, ffmpeg: config.ffmpeg })
-    mount('milky', MilkyAdapter, adapterDefaults.milky)
-    mount('ntqq-universal', NTQQUniversal)
-    mount('store', Store, { msgCacheExpire: config.msgCacheExpire! })
-    mount('emailNotification', EmailNotificationService)
-    mount('webuiServer', WebuiServer)
-    // Route plugins: their inject lists have to be satisfiable by the real services
-    mount('ntLoginRoutes', NTLoginRoutes)
-    mount('loginInfoRoutes', LoginInfoRoutes)
-    mount('webqq', WebQQ)
-    mount('dashboard', Dashboard)
-    mount('logs', Logs)
-    mount('emailRoutes', EmailRoutes)
-
-    await vi.waitFor(() => {
-      const stuck = Object.entries(fibers)
-        .filter(([, fiber]) => fiber.state !== FiberState.ACTIVE)
-        .map(([name, fiber]) => `${name}=${FiberState[fiber.state]}`)
-      expect(stuck).toEqual([])
-    }, { timeout: 4_000, interval: 200 })
-
-    for (const name of [
-      'config', 'qqProtocol', 'bots', 'timer', 'database', 'model', 'store', 'app',
-      'ntFileApi', 'ntFriendApi', 'ntGroupApi', 'ntLoginApi', 'ntMsgApi', 'ntUserApi', 'ntWebApi', 'ntSystemApi',
-      'onebot', 'satori', 'milky', 'emailNotification', 'webuiServer',
-    ]) {
-      expect(ctx.get(name), name).toBeDefined()
-    }
-
-    await Promise.all(Object.values(fibers).reverse().map(fiber => fiber.dispose()))
   })
 })

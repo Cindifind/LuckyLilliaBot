@@ -4,11 +4,12 @@ import path from 'node:path'
 import { satisfies } from 'compare-versions'
 import { satisfies as satisfiesRange, validRange } from 'semver'
 import type { LLBotManifest, PluginCategory } from '@luckylillia/plugin-sdk'
+import { inspectPackageLocation, type PackageLocation } from './package-location'
 
 export const SDK_PACKAGE = '@luckylillia/plugin-sdk'
 
 /** The values of `llbot.category`, in the order the plugin page lists them. */
-export const PLUGIN_CATEGORIES: readonly PluginCategory[] = ['protocol', 'adapter', 'chat', 'tool', 'service', 'other']
+export const PLUGIN_CATEGORIES: readonly PluginCategory[] = ['protocol', 'adapter', 'chat', 'tool', 'service', 'theme', 'other']
 
 /** Extensions of the images a package may show in the WebUI: its icon, screenshots and what its details show. */
 export const IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg']
@@ -33,12 +34,16 @@ export interface PluginPackage {
   version: string
   /** Absolute package directory. */
   root: string
+  /** Original scanned entry; deletion must use this instead of following root into linked source code. */
+  location?: PackageLocation
   /** Absolute entry file. */
   main: string
   manifest: LLBotManifest
   description?: string
   /** package.json `author` */
   author?: PluginAuthor
+  /** Browser URL normalized from package.json `repository`; HTTP(S) only. */
+  repository?: string
   /** `peerDependencies['@luckylillia/plugin-sdk']`, if declared. */
   sdkRange?: string
   /** Absolute path of the `llbot.webui` module, when it exists inside the package. */
@@ -75,7 +80,10 @@ export async function scanPluginRoots(roots: string[]): Promise<ScanResult> {
       for (const candidate of candidates) {
         try {
           const pkg = await readPluginPackage(candidate)
-          if (pkg) result.packages.push(pkg)
+          if (pkg) {
+            pkg.location = await inspectPackageLocation(root, candidate).catch(() => undefined)
+            result.packages.push(pkg)
+          }
         } catch (e) {
           result.errors.push({ path: candidate, error: (e as Error).message })
         }
@@ -121,6 +129,7 @@ export async function readPluginPackage(dir: string): Promise<PluginPackage | un
     },
     description: typeof pkg.description === 'string' ? pkg.description : undefined,
     author: parseAuthor(pkg.author),
+    repository: parseRepository(pkg.repository),
     sdkRange: pkg.peerDependencies?.[SDK_PACKAGE],
     webui,
     iconFile: typeof icon === 'string' && isImagePath(icon) ? packageFile(root, icon, 'llbot.icon', warnings) : undefined,
@@ -149,6 +158,26 @@ export function parseAuthor(value: unknown): PluginAuthor | undefined {
   // It becomes a link in the WebUI
   if (url && /^https?:\/\//i.test(url)) author.url = url
   return author
+}
+
+/** npm repository metadata is a browser link here, never a Git transport URL. */
+export function parseRepository(value: unknown): string | undefined {
+  const field = value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>).url : value
+  if (typeof field !== 'string') return
+  let source = field.trim()
+  if (!source || /[\u0000-\u001f\u007f\\]/.test(source)) return
+  source = source.replace(/^git\+(?=https?:\/\/)/i, '')
+    .replace(/^(?:github:|git@github\.com:)/i, 'https://github.com/')
+    .replace(/^(?:git:\/\/|(?:git\+)?ssh:\/\/git@)github\.com\//i, 'https://github.com/')
+  try {
+    const url = new URL(source)
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return
+    url.pathname = url.pathname.replace(/\.git\/?$/i, '')
+    return url.href
+  } catch {
+    return
+  }
 }
 
 /** `llbot.screenshots`: images, or `{ src, caption }`; what is not an image in the package is dropped with a warning */

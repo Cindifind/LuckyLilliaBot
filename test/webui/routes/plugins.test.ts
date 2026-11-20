@@ -18,6 +18,8 @@ beforeEach(() => {
     scan: vi.fn(async () => ({ added: ['c'], changed: [], removed: [] })),
     add: vi.fn(async (name: string) => status('new', { name })),
     remove: vi.fn(async () => undefined),
+    removePackage: vi.fn(async () => ['a', 'b']),
+    uninstallPackage: vi.fn(async () => ({ removed: ['a'], instances: [] })),
     enable: vi.fn(async (id: string) => status(id)),
     disable: vi.fn(async (id: string) => status(id, { state: 'disposed' })),
     reload: vi.fn(async () => ({ status: 'reloaded' })),
@@ -40,6 +42,38 @@ beforeEach(() => {
 const json = async (response: Response) => ({ status: response.status, body: await response.json() })
 
 describe('plugin routes', () => {
+  it.each([true, false])('uninstalls through the host using the stored package identity (%s)', async keepConfig => {
+    expect(await json(await app.request('/api/plugins/a/uninstall', { method: 'POST', body: JSON.stringify({ keepConfig, path: '../untrusted' }) }))).toEqual({
+      status: 200, body: { success: true, data: { removed: ['a'], instances: [] } },
+    })
+    expect(plugins.uninstallPackage).toHaveBeenCalledWith('pkg-a', { keepConfig })
+  })
+
+  it('requires an explicit configuration choice for host uninstall', async () => {
+    expect((await json(await app.request('/api/plugins/a/uninstall', { method: 'POST', body: '{}' }))).status).toBe(400)
+    expect(plugins.uninstallPackage).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])('removes missing package entries with the selected configuration retention (%s)', async keepConfig => {
+    plugins.get.mockReturnValue(status('a', { name: '@luckylillia/plugin-onebot11', state: 'missing' }))
+    expect(await json(await app.request('/api/plugins/a/remove-missing', { method: 'POST', body: JSON.stringify({ keepConfig }) }))).toEqual({
+      status: 200, body: { success: true, data: { removed: ['a', 'b'] } },
+    })
+    expect(plugins.scan).toHaveBeenCalledOnce()
+    expect(plugins.removePackage).toHaveBeenCalledWith('@luckylillia/plugin-onebot11', { keepConfig, missingOnly: true })
+  })
+
+  it('rejects invalid configuration retention before changing any entries', async () => {
+    expect((await json(await app.request('/api/plugins/a/remove-missing', { method: 'POST', body: JSON.stringify({ keepConfig: 'false' }) }))).status).toBe(400)
+    expect(plugins.removePackage).not.toHaveBeenCalled()
+  })
+
+  it('keeps a restored or builtin package when missing-package removal is rejected', async () => {
+    plugins.removePackage.mockRejectedValue(new PluginForbiddenError('cannot remove this package'))
+    expect((await json(await app.request('/api/plugins/a/remove-missing', { method: 'POST', body: '{}' }))).status).toBe(403)
+    expect(plugins.remove).not.toHaveBeenCalled()
+  })
+
   it('lists entries without the hidden ones', async () => {
     expect(await json(await app.request('/api/plugins'))).toEqual({
       status: 200,

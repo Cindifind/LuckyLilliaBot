@@ -1,0 +1,15 @@
+{
+  "name": "luckylillia-plugin-theme-demo",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "description": "WebUI 主题及界面扩展能力示例",
+  "peerDependencies": { "@luckylillia/plugin-sdk": "^1.0.1" },
+  "llbot": {
+    "title": "主题能力示例",
+    "category": "theme",
+    "icon": "palette",
+    "webui": "client/index.js",
+    "service": { "required": [], "implements": [] }
+  }
+}

@@ -3,7 +3,7 @@ import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import type { Context } from 'cordis'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
-import { createMarketRoutes, Market } from '@/plugin/internal/tool/market'
+import { createMarketRoutes, Market } from '@/plugin/internal/tool/market/index'
 import { Catalog } from '@/plugin/internal/tool/market/catalog'
 import { Registry, RegistryError, type PackageVersion, type Packument } from '@/plugin/internal/tool/market/registry'
 

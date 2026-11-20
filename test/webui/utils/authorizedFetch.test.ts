@@ -33,7 +33,17 @@ describe('authorizedFetch', () => {
     vi.stubGlobal('fetch', fetch)
     expect((await authorizedFetch('/api/config')).status).toBe(200)
     expect(prompt).toHaveBeenCalledOnce()
-    expect(fetch.mock.calls[1][1].headers['x-webui-token']).toBe(cookies.get(tokenCookieName()))
+    expect(new Headers(fetch.mock.calls[1][1].headers).get('x-webui-token')).toBe(cookies.get(tokenCookieName()))
+  })
+
+  it('preserves Headers instances when adding the WebUI token', async () => {
+    cookies.set(tokenCookieName(), 'stored-token')
+    const fetch = vi.fn().mockResolvedValue(new Response('{}'))
+    vi.stubGlobal('fetch', fetch)
+    await authorizedFetch('/api/config', { headers: new Headers({ 'Content-Type': 'application/json' }) })
+    const headers = new Headers(fetch.mock.calls[0][1].headers)
+    expect(headers.get('content-type')).toBe('application/json')
+    expect(headers.get('x-webui-token')).toBe('stored-token')
   })
 
   it('leaves a 401 or 403 that a route answers on its own to the caller', async () => {

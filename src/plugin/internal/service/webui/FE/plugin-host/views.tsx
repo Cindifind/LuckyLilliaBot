@@ -65,13 +65,13 @@ export const SlotOutlet: React.FC<SlotOutletProps> = ({ name, props, match, wrap
     key: contributionKey(contribution),
     where: describeContribution(declaration, contribution),
   })
-  if (declaration?.cardinality === 'chain') {
+  if (declaration?.cardinality === 'chain' || declaration?.cardinality === 'hoc') {
     // From the inside out: each link gets what the ones after it drew, and a link that throws stands aside
     const chained = contents.reduceRight<ReactNode>((next, contribution) => {
       const { owner, component: Component } = contribution
       return (
-        <PluginBoundary owner={owner} failure={failure(contribution)} passThrough={next}>
-          <Component {...props} next={next} />
+        <PluginBoundary key={`${contributionKey(contribution)}|${match ?? ''}`} owner={owner} failure={failure(contribution)} passThrough={next}>
+          {declaration.cardinality === 'hoc' ? <Component {...props}>{next}</Component> : <Component {...props} next={next} />}
         </PluginBoundary>
       )
     }, children ?? null)
@@ -212,14 +212,21 @@ export const PluginPage: React.FC<{ page: PageContribution; fullscreen?: boolean
   if (!page.settings && !running) return <PluginNotRunning plugin={plugin!} plugins={plugins} blocker={blocker} />
   const notice = blocker ? `${blocker.headline}：${blocker.detail}`
     : page.settings && plugin?.notice ? `「${pluginTitle(plugin)}」${plugin.notice}` : undefined
+  const content = (
+    <PluginBoundary key={page.key} owner={owner} failure={{ key: pageContributionKey(page), where: `页面「${page.title}」` }}>
+      <Component />
+    </PluginBoundary>
+  )
   return (
     <>
       {notice && <PageNotice action={blocker?.action && { label: blocker.action.label, onClick: go(blocker.action.tab) }}>{notice}</PageNotice>}
       {/* One boundary per page, so that an error on one page does not stick to the next one of the same plugin */}
       <PageViewContext.Provider value={fullscreen ? FULLSCREEN : WINDOWED}>
-        <PluginBoundary key={page.key} owner={owner} failure={{ key: pageContributionKey(page), where: `页面「${page.title}」` }}>
-          <Component />
-        </PluginBoundary>
+        {page.locked ? content : (
+          <SlotOutlet name="page.content" match={page.key} props={{ page: { key: page.key, owner, title: page.title, fullscreen } }}>
+            {content}
+          </SlotOutlet>
+        )}
       </PageViewContext.Provider>
     </>
   )

@@ -1,5 +1,5 @@
 import { defineConfig, Plugin } from 'vite'
-import { builtinModules, createRequire } from 'node:module'
+import { builtinModules } from 'node:module'
 import { version } from './src/version.ts'
 import cp from 'vite-plugin-cp'
 import path from 'node:path'
@@ -9,10 +9,6 @@ function writeVersion(): Plugin {
   return {
     name: 'write-version',
     buildStart() {
-      const nativeRoot = path.resolve('src/native/production')
-      const loader = createRequire(import.meta.url)(path.join(nativeRoot, 'loader.cjs'))
-      const bundle = loader.inspectBundle(nativeRoot, { allTargets: true })
-      if (bundle.manifest.variant !== 'production') throw new Error('Production Bot build requires production native artifacts')
       const pkgJsonPath = './package-dist.json'
       const pkgJsonRaw = fs.readFileSync(pkgJsonPath, 'utf8')
       const packageJson = JSON.parse(pkgJsonRaw)
@@ -53,7 +49,6 @@ const pluginShared = ['cordis', 'cosmokit', 'schemastery', '@standard-schema/spe
 
 const external = [...new Set([
   'ws',
-  'silk-wasm',
   // Carries its HTTP parser as embedded WASM: copied as it is rather than bundled
   'undici',
   ...getModuleDependencies('reggol'),
@@ -96,10 +91,6 @@ export default defineConfig({
             { src: './package-dist.json', dest: 'dist/', rename: 'package.json' },
             { src: './doc/使用说明.txt', dest: 'dist/' },
             { src: './doc/更新日志.txt', dest: 'dist/' },
-            { src: './src/native/production', dest: 'dist/native', flatten: false },
-            ...(process.env.LLBOT_BUILD_DEV_NATIVE === '1'
-              ? [{ src: './src/native/development', dest: 'dist/native-dev', flatten: false }]
-              : []),
           ],
         }),
       ],

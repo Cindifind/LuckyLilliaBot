@@ -3,6 +3,7 @@ import { createTestApp } from '../helpers/testApp'
 import { createMockContext } from '../helpers/mockContext'
 import { createConfigRoutes } from '@/plugin/internal/service/webui/BE/routes/config'
 import { PluginConfigError } from '@/plugin/host'
+import { ADAPTER_ENTRIES } from '@/main/config/upgrade'
 
 vi.mock('@/main/config', () => ({
   webuiTokenUtil: {
@@ -90,8 +91,8 @@ describe('config routes', () => {
     beforeEach(() => {
       calls.length = 0
       plugins = {
-        builtinSettings: vi.fn((name: string) => name === 'builtin:satori'
-          ? { id: 'sat', enabled: false, config: { host: '127.0.0.1', port: 5600, token: '' } }
+        entrySettings: vi.fn((name: string) => name === 'builtin:satori'
+          ? { id: 'sat', enabled: false, trusted: true, config: { host: '127.0.0.1', port: 5600, token: '' } }
           : undefined),
         updateConfig: vi.fn(async () => { calls.push('update') }),
         enable: vi.fn(async () => { calls.push('enable') }),
@@ -117,7 +118,7 @@ describe('config routes', () => {
     })
 
     it('switches an adapter off before changing it', async () => {
-      plugins.builtinSettings.mockReturnValue({ id: 'sat', enabled: true, config: { host: '', port: 5600, token: 'abc' } })
+      plugins.entrySettings.mockReturnValue({ id: 'sat', enabled: true, trusted: true, config: { host: '', port: 5600, token: 'abc' } })
       await post({ satori: { enable: false, token: '' } })
       expect(calls).toEqual(['disable', 'update'])
     })
@@ -127,6 +128,28 @@ describe('config routes', () => {
       const res = await post({ satori: { host: '' }, log: false })
       expect(res.status).toBe(400)
       expect((await res.json()).message).toContain('Satori')
+      expect(ctx.config.patch).not.toHaveBeenCalled()
+    })
+
+    it('updates an installed external adapter through the legacy section', async () => {
+      plugins.entrySettings.mockImplementation((name: string) => name === ADAPTER_ENTRIES.milky
+        ? { id: 'milk', enabled: false, trusted: true, config: { http: { host: '127.0.0.1', port: 3010, accessToken: 'retained' } } }
+        : undefined)
+      const res = await post({ milky: { enable: true, http: { port: 3011 } } })
+      expect(res.status).toBe(200)
+      expect(plugins.updateConfig).toHaveBeenCalledWith('milk', { http: { host: '127.0.0.1', port: 3011, accessToken: 'retained' } }, undefined, [], {})
+      expect(plugins.enable).toHaveBeenCalledWith('milk', {})
+      expect(ctx.config.patch).not.toHaveBeenCalled()
+    })
+
+    it('requires explicit trust before changing an external adapter', async () => {
+      plugins.entrySettings.mockImplementation((name: string) => name === ADAPTER_ENTRIES.ob11
+        ? { id: 'ob', enabled: false, trusted: false, config: { connect: [] } }
+        : undefined)
+      const res = await post({ ob11: { enable: true, connect: [] } })
+      expect(res.status).toBe(428)
+      expect(await res.json()).toMatchObject({ success: false, data: { package: ADAPTER_ENTRIES.ob11 } })
+      expect(calls).toEqual([])
       expect(ctx.config.patch).not.toHaveBeenCalled()
     })
   })

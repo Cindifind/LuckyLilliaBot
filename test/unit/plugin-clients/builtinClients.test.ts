@@ -13,7 +13,12 @@ const isDir = (dir: string) => statSync(dir).isDirectory()
 
 const categories = readdirSync(INTERNAL).filter(entry => isDir(path.join(INTERNAL, entry)))
 const pluginDirs = categories.flatMap(category => readdirSync(path.join(INTERNAL, category))
-  .filter(entry => isDir(path.join(INTERNAL, category, entry)))
+  .filter(entry => {
+    const dir = path.join(INTERNAL, category, entry)
+    // Extraction may leave empty directories or ignored crash dumps; only source directories are plugins.
+    return isDir(dir) && readdirSync(dir, { recursive: true, withFileTypes: true })
+      .some(item => item.isFile() && /\.[cm]?[jt]sx?$/.test(item.name))
+  })
   .map(name => ({ category, name })))
 const clientDirs = pluginDirs
   .map(({ category, name }) => path.join(INTERNAL, category, name, 'client'))
@@ -35,7 +40,7 @@ describe('builtin plugins', () => {
     expect(pluginDirs.map(({ name }) => name).sort())
       .toEqual(builtinPlugins.map(builtin => builtin.name.replace(/^builtin:/, '')).sort())
     for (const { category, name } of pluginDirs) {
-      const { builtin } = await import(`@/plugin/internal/${category}/${name}/builtin`)
+      const { builtin } = await import(`@/plugin/internal/${category}/${name}/builtin.ts`)
       expect(builtin.name, name).toBe(`builtin:${name}`)
       expect(builtin.manifest.category, name).toBe(category)
     }

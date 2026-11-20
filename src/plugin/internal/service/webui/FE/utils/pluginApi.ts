@@ -16,6 +16,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export const listPlugins = () => request<PluginStatus[]>('')
+export const getPluginDirectories = () => request<{ roots: string[] }>('/directories')
 
 export const scanPlugins = () =>
   request<{ added: string[]; changed: string[]; removed: string[] }>('/scan', { method: 'POST' })
@@ -45,13 +46,19 @@ export const addPluginInstance = (name: string, trust = false) => trusting(() =>
 export const setPluginScope = (id: string, scope: EntryScope | undefined) =>
   request<PluginStatus>(`/${id}/scope`, { method: 'PUT', body: JSON.stringify({ scope: scope ?? null }) })
 
-/** Entry ids whose message listeners run first, in this order; [] goes back to the start order. */
-export const setMessageOrder = (order: string[]) =>
-  request<string[]>('/order', { method: 'PUT', body: JSON.stringify({ order }) })
-
 export const clearListenerError = (id: string) => request<PluginStatus>(`/${id}/listener-error`, { method: 'DELETE' })
 
 export const removePlugin = (id: string) => request<null>(`/${id}`, { method: 'DELETE' })
+
+/** Removes this instance's entries for a missing package, optionally archiving their configuration. */
+export const removeMissingPlugin = (id: string, keepConfig: boolean) =>
+  request<{ removed: string[] }>(`/${id}/remove-missing`, { method: 'POST', body: JSON.stringify({ keepConfig }) })
+
+/** Also supports local directories and developer links, without requiring the market plugin. */
+export const uninstallPlugin = (id: string, keepConfig: boolean) =>
+  request<{ removed: string[]; instances: { instance: string; status: string; reason?: string }[] }>(`/${id}/uninstall`, {
+    method: 'POST', body: JSON.stringify({ keepConfig }),
+  })
 
 export const describePlugin = (id: string) => request<PluginDescription>(`/${id}/schema`)
 
@@ -99,14 +106,14 @@ export type PluginStreamEvent = { type: 'status'; data: PluginStatus } | { type:
 
 /**
  * Subscribes to state changes; returns the unsubscribe function. The browser reconnects a dropped stream by itself,
- * e.g. across a restart of the bot, but what changed meanwhile is not replayed: `onReconnect` is for fetching anew.
+ * e.g. across a restart of the bot. Every connection needs a fresh snapshot: the initial HTTP read may also
+ * predate the stream's subscription, and changes during that gap are not replayed.
  */
-export function openPluginStream(onEvent: (event: PluginStreamEvent) => void, onReconnect?: () => void): () => void {
+export function openPluginStream(onEvent: (event: PluginStreamEvent) => void, onConnected?: () => void): () => void {
   const token = getToken() || ''
   const source = new EventSource(`${BASE}/stream?token=${encodeURIComponent(token)}`)
-  let connections = 0
   source.addEventListener('connected', () => {
-    if (connections++) onReconnect?.()
+    onConnected?.()
   })
   source.addEventListener('changed', (event) => {
     try {

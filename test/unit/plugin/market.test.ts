@@ -9,18 +9,21 @@ import { crc32, createGzip, deflateRawSync, gzipSync } from 'node:zlib'
 import { Context, Fiber } from 'cordis'
 import TimerService from '@cordisjs/plugin-timer'
 import { Hono } from 'hono'
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { PluginCategory } from '@luckylillia/plugin-sdk'
 import PluginService from '@/plugin/host'
-import { createMarketRoutes, Market, MarketError } from '@/plugin/internal/tool/market'
+import { createMarketRoutes, Market, MarketError } from '@/plugin/internal/tool/market/index'
 import { readLocalPackage as readArchive } from '@/plugin/internal/tool/market/archive'
 import { Catalog } from '@/plugin/internal/tool/market/catalog'
 import {
-  matches, PackageVersion, Packument, parseSpec, pickVersion, Registry, verify,
+  matches, PackageVersion, Packument, parseSpec, pickVersion, Registries, Registry, verify,
 } from '@/plugin/internal/tool/market/registry'
 import { extractPackage, readTar, readTarStream } from '@/plugin/internal/tool/market/tar'
+import { startRequestedPlugins } from '@/main/startupPlugins'
 
 declare global {
   var __marketTest: string[]
+  var __marketStop: (() => void) | undefined
 }
 
 const tmpRoot = path.resolve('.tmp')
@@ -482,6 +485,8 @@ interface Publish {
   title?: string
   description?: string
   author?: { name: string; url?: string }
+  /** Category registered in the catalog, independently of llbot.category. */
+  category?: PluginCategory
   /** Leaves the latest tag where it is */
   untagged?: boolean
   /** Serves bytes that fail the checksum */
@@ -494,7 +499,7 @@ const CATALOG = '@luckylillia/market'
 async function startRegistry() {
   const documents = new Map<string, Packument>()
   const tarballs = new Map<string, Buffer>()
-  const entries = new Map<string, { name: string; title: string; description: string; author: { name: string; url?: string }; repository: string }>()
+  const entries = new Map<string, { name: string; title: string; description: string; author: { name: string; url?: string }; repository: string; category?: PluginCategory }>()
   const versions = new Map<string, string>()
   let catalogVersion = 0
   let catalogFailure = 0
@@ -526,7 +531,13 @@ async function startRegistry() {
       versions: Object.fromEntries(Object.entries(doc.versions).map(([version, { llbot: _, description: __, ...rest }]) => [version, rest])),
     })
   })
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  // Some Windows dynamic port ranges include ports Fetch blocks (e.g. 5060/5061). Keep this HTTP fixture above
+  // that list; listening successfully alone does not mean the fetch-based registry can reach it.
+  for (;;) {
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    if ((server.address() as AddressInfo).port > 10240) break
+    await new Promise<void>(resolve => server.close(() => resolve()))
+  }
   const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
 
   function publish(name: string, version: string, options: Publish = {}) {
@@ -563,6 +574,7 @@ async function startRegistry() {
         name, title: options.title ?? name, description: options.description ?? `${name} plugin`,
         author: options.author ?? { name: 'Alice', url: 'https://github.com/alice' },
         repository: `https://github.com/example/${name.split('/').pop()}`,
+        category: options.category,
       })
       if (options.pinnedVersion) versions.set(name, options.pinnedVersion)
       else if (!options.untagged || !versions.has(name)) versions.set(name, version)
@@ -572,8 +584,7 @@ async function startRegistry() {
 
   function publishCatalog() {
     publish(CATALOG, `1.0.${++catalogVersion}`, { files: {
-      'plugins.json': JSON.stringify([...entries.values()]),
-      'versions.json': JSON.stringify(Object.fromEntries(versions)),
+      'plugins.json': JSON.stringify([...entries.values()].map(entry => ({ ...entry, version: versions.get(entry.name) }))),
     } })
   }
   publishCatalog()
@@ -596,8 +607,10 @@ describe('the market', () => {
   let pluginRoot: string
   let pluginsFile: string
   let market: Market
+  const otherServices: Fiber[] = []
 
   const PLUGIN = 'luckylillia-plugin-greet'
+  const emptyCategories = { protocol: 0, adapter: 0, chat: 0, tool: 0, service: 0, theme: 0, other: 0 }
   const pluginCode = (tag: string) => `
     import a from 'a'
     import b from 'b'
@@ -634,6 +647,7 @@ describe('the market', () => {
   })
 
   afterEach(async () => {
+    for (const other of otherServices.splice(0)) await other.dispose()
     await service?.dispose()
     service = undefined
     await registry.close()
@@ -671,6 +685,278 @@ describe('the market', () => {
     files: { 'index.js': "export function apply() { globalThis.__marketTest.push('updated') }" },
   })
 
+  const peerInstance = async (instance: string, extra: Partial<PluginService.Config> = {}) => {
+    const peer = new Context()
+    await peer.plugin(TimerService)
+    const file = path.join(path.dirname(pluginRoot), instance, 'plugins.json')
+    otherServices.push(await peer.plugin(PluginService, { file, roots: [pluginRoot], trust: true, ...extra }))
+    return { ctx: peer, file, market: new Market(peer, new Registry(registry.url), pluginRoot) }
+  }
+
+  describe('explicit startup package requests', () => {
+    it('installs multiple unlisted npm plugins and their required plugins, trusting dependencies before consumers', async () => {
+      publishPlugin('@example/provider', {}, '1.0.0', { listed: false })
+      publishPlugin('@example/consumer', { '@example/provider': '^1.0.0' }, '1.0.0', { listed: false })
+      registry.failCatalog()
+      await startRequestedPlugins(ctx, ['@example/consumer', PLUGIN], market)
+      expect(ctx.plugins.list()).toHaveLength(3)
+      expect(ctx.plugins.list().every(entry => entry.state === 'active' && entry.trusted && !entry.disabled)).toBe(true)
+      expect(catalogRequests()).toEqual([])
+      expect(JSON.parse(readFileSync(pluginsFile, 'utf8')).trusted).toEqual(expect.arrayContaining(['@example/provider', '@example/consumer', PLUGIN]))
+    })
+
+    it('reuses installed versions and retains per-entry configuration and multi-entry enable choices without network', async () => {
+      publishPlugin('@example/saved', {}, '1.0.0', { listed: false, files: { 'index.js': "import Schema from 'schemastery'; export const Config = Schema.object({ secret: Schema.string() }); export function apply() {}" } })
+      await market.ensureRequested('@example/saved')
+      const original = ctx.plugins.list().find(entry => entry.name === '@example/saved')!
+      await ctx.plugins.updateConfig(original.id, { secret: 'retained' })
+      const other = await ctx.plugins.add('@example/saved', { secret: 'other' }, { trust: true })
+      registry.publish('@example/saved', '2.0.0', { plugin: true, files: { 'index.js': 'export function apply() {}' } })
+      registry.requests.length = 0
+      await startRequestedPlugins(ctx, ['@example/saved', '@example/saved'], market)
+      expect(registry.requests).toEqual([])
+      expect(installedVersion('@example/saved')).toBe('1.0.0')
+      expect(ctx.plugins.get(original.id)).toMatchObject({ disabled: true })
+      expect(ctx.plugins.get(other.id)).toMatchObject({ disabled: false, state: 'active' })
+      expect(JSON.parse(readFileSync(pluginsFile, 'utf8')).entries.filter((entry: { name: string }) => entry.name === '@example/saved')).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: original.id, config: { secret: 'retained' } }), expect.objectContaining({ id: other.id, config: { secret: 'other' } }),
+      ]))
+    })
+
+    it('restores retained settings and the original entry id when installing a requested package again', async () => {
+      publishPlugin('@example/retained', {}, '1.0.0', { listed: false })
+      await startRequestedPlugins(ctx, ['@example/retained'], market)
+      const original = ctx.plugins.list().find(entry => entry.name === '@example/retained')!
+      await ctx.plugins.updateConfig(original.id, { secret: 'preserve-me' })
+      await market.uninstall('@example/retained', { keepConfig: true })
+      await startRequestedPlugins(ctx, ['@example/retained'], market)
+      expect(ctx.plugins.get(original.id)).toMatchObject({ state: 'active', disabled: false, trusted: true })
+      expect(ctx.plugins.entrySettings('@example/retained')?.config).toEqual({ secret: 'preserve-me' })
+    })
+
+    it('selects a compatible npm release and refuses incompatible installed dependencies without changing them', async () => {
+      publishPlugin('@example/provider', {}, '1.0.0', { listed: false })
+      publishPlugin('@example/provider', {}, '2.0.0', { listed: false, peerDependencies: { '@luckylillia/plugin-sdk': '>=999.0.0' } })
+      await startRequestedPlugins(ctx, ['@example/provider'], market)
+      expect(installedVersion('@example/provider')).toBe('1.0.0')
+      publishPlugin('@example/consumer', { '@example/provider': '^2.0.0' }, '1.0.0', { listed: false })
+      await expect(startRequestedPlugins(ctx, ['@example/consumer'], market)).rejects.toThrow('already installed')
+      expect(existsSync(path.join(pluginRoot, '@example/consumer'))).toBe(false)
+      expect(installedVersion('@example/provider')).toBe('1.0.0')
+    })
+
+    it('reports failed requested plugins while still attempting independent requests', async () => {
+      publishPlugin('@example/broken', {}, '1.0.0', { listed: false, files: { 'index.js': "export function apply() { throw new Error('startup failed') }" } })
+      await expect(startRequestedPlugins(ctx, ['@example/broken', PLUGIN], market)).rejects.toThrow('@example/broken')
+      expect(status()).toMatchObject({ state: 'active', trusted: true })
+    })
+
+    it('coordinates simultaneous installs and enables only the requesting instance', async () => {
+      const peer = await peerInstance('startup-peer')
+      const results = await Promise.all([market.ensureRequested(PLUGIN), peer.market.ensureRequested(PLUGIN)])
+      expect(results.flatMap(result => result.installed)).toHaveLength(1)
+      await startRequestedPlugins(ctx, [PLUGIN], market)
+      expect(status()).toMatchObject({ state: 'active', trusted: true })
+      expect(peer.ctx.plugins.list().find(entry => entry.name === PLUGIN)).toMatchObject({ disabled: true, trusted: false })
+    })
+
+    it.each([false, true])('handles an installed package in a read-only root without network (missing dependency: %s)', async missingDependency => {
+      const root = path.join(path.dirname(pluginRoot), 'startup-readonly')
+      mkdirSync(path.join(root, 'example'), { recursive: true })
+      writeFileSync(path.join(root, 'example', 'package.json'), JSON.stringify({
+        name: 'example', version: '1.0.0', main: 'index.js', type: 'module',
+        llbot: missingDependency ? { dependencies: { '@example/missing': '^1.0.0' } } : {},
+      }))
+      writeFileSync(path.join(root, 'example', 'index.js'), 'export function apply() {}')
+      writeFileSync(path.join(root, '.llbot-packages'), 'metadata unavailable')
+      const peer = await peerInstance('startup-readonly-instance', { roots: [root] })
+      const readonlyMarket = new Market(peer.ctx, new Registry(registry.url), root)
+      registry.requests.length = 0
+      if (missingDependency) {
+        await expect(startRequestedPlugins(peer.ctx, ['example'], readonlyMarket)).rejects.toThrow()
+        expect(peer.ctx.plugins.list().find(entry => entry.name === 'example')?.disabled).toBe(true)
+      } else {
+        await startRequestedPlugins(peer.ctx, ['example'], readonlyMarket)
+        expect(peer.ctx.plugins.list().find(entry => entry.name === 'example')).toMatchObject({ state: 'active', trusted: true, disabled: false })
+      }
+      await expect(readonlyMarket.ensureRequested('@example/absent')).rejects.toThrow('只读')
+      expect(registry.requests).toEqual([])
+    })
+  })
+
+  const coordinatedCode = (version: string, fail = false) => `
+    import Schema from 'schemastery'
+    export const Config = Schema.object({ n: Schema.number().default(0) })
+    export function apply(ctx, config) {
+      if (${fail} && config.n === 2) throw new Error('instance-specific failure')
+      globalThis.__marketTest.push('${version}:' + config.n)
+      ctx.effect(() => () => globalThis.__marketTest.push('stop-${version}:' + config.n))
+    }
+  `
+
+  it('coordinates every live instance without HMR, keeping individual config and disabled entries', async () => {
+    publishPlugin(PLUGIN, {}, '1.0.0', { files: { 'index.js': coordinatedCode('old') } })
+    await market.install(PLUGIN)
+    const peer = await peerInstance('other-instance')
+    const paused = await peerInstance('disabled-instance')
+    const id = status()!.id
+    const other = peer.ctx.plugins.list().find(entry => entry.name === PLUGIN)!
+    await ctx.plugins.updateConfig(id, { n: 1 })
+    await peer.ctx.plugins.updateConfig(other.id, { n: 2 })
+    await ctx.plugins.enable(id, { trust: true })
+    await peer.ctx.plugins.enable(other.id, { trust: true })
+    globalThis.__marketTest = []
+    publishPlugin(PLUGIN, {}, '1.1.0', { files: { 'index.js': coordinatedCode('new') } })
+    const result = await market.update(PLUGIN, '1.1.0', '1.0.0')
+    expect(result.instances).toEqual(expect.arrayContaining([
+      expect.objectContaining({ instance: 'other-instance', status: 'reloaded' }),
+      expect.objectContaining({ instance: 'disabled-instance', status: 'unchanged' }),
+    ]))
+    expect(globalThis.__marketTest.slice(0, 2).sort()).toEqual(['stop-old:1', 'stop-old:2'])
+    expect(globalThis.__marketTest.slice(2).sort()).toEqual(['new:1', 'new:2'])
+    expect(peer.ctx.plugins.list().find(entry => entry.name === PLUGIN)).toMatchObject({ version: '1.1.0', state: 'active', disabled: false, reloadCount: 1 })
+    expect(paused.ctx.plugins.list().find(entry => entry.name === PLUGIN)).toMatchObject({ version: '1.1.0', disabled: true, reloadCount: 0 })
+    expect(JSON.parse(readFileSync(peer.file, 'utf8')).entries.find((entry: { id: string }) => entry.id === other.id).config).toEqual({ n: 2 })
+  })
+
+  it('serializes updates requested by different instances and rechecks the installed version', async () => {
+    await market.install(PLUGIN)
+    const peer = await peerInstance('other-instance')
+    publishPlugin(PLUGIN, {}, '1.1.0')
+    const results = await Promise.allSettled([market.update(PLUGIN, '1.1.0', '1.0.0'), peer.market.update(PLUGIN, '1.1.0', '1.0.0')])
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    expect(results.find(result => result.status === 'rejected')).toMatchObject({ reason: { status: 409 } })
+    expect(installedVersion(PLUGIN)).toBe('1.1.0')
+  })
+
+  it('refuses replacement before stopping plugins if another instance cannot import the candidate', async () => {
+    await market.install(PLUGIN)
+    const peer = await peerInstance('unsupported-instance', { resolver: false })
+    await peer.ctx.plugins.enable(peer.ctx.plugins.list().find(entry => entry.name === PLUGIN)!.id, { trust: true })
+    publishPlugin(PLUGIN, {}, '1.1.0')
+    await expect(market.update(PLUGIN, '1.1.0', '1.0.0')).rejects.toThrow(/无法重新导入/)
+    expect(installedVersion(PLUGIN)).toBe('1.0.0')
+    expect(peer.ctx.plugins.list().find(entry => entry.name === PLUGIN)).toMatchObject({ version: '1.0.0', state: 'active' })
+  })
+
+  it('reports a peer initialization failure without claiming the update loaded everywhere', async () => {
+    publishPlugin(PLUGIN, {}, '1.0.0', { files: { 'index.js': coordinatedCode('old') } })
+    await market.install(PLUGIN)
+    const peer = await peerInstance('broken-instance')
+    const other = peer.ctx.plugins.list().find(entry => entry.name === PLUGIN)!
+    await peer.ctx.plugins.updateConfig(other.id, { n: 2 })
+    await peer.ctx.plugins.enable(other.id, { trust: true })
+    publishPlugin(PLUGIN, {}, '1.1.0', { files: { 'index.js': coordinatedCode('new', true) } })
+    const result = await market.update(PLUGIN, '1.1.0', '1.0.0')
+    expect(result.reload).toMatchObject({ status: 'failed', reason: expect.stringContaining('broken-instance') })
+    expect(result.instances).toContainEqual(expect.objectContaining({ instance: 'broken-instance', status: 'failed', reason: expect.stringContaining('instance-specific failure') }))
+    expect(peer.ctx.plugins.list().find(entry => entry.name === PLUGIN)?.error).toContain('instance-specific failure')
+  })
+
+  it('does not double reload a peer that also enables development HMR', async () => {
+    publishPlugin(PLUGIN, {}, '1.0.0', { files: { 'index.js': coordinatedCode('old') } })
+    await market.install(PLUGIN)
+    const peer = await peerInstance('hmr-instance', { hmr: true })
+    await peer.ctx.plugins.enable(peer.ctx.plugins.list().find(entry => entry.name === PLUGIN)!.id, { trust: true })
+    publishPlugin(PLUGIN, {}, '1.1.0', { files: { 'index.js': coordinatedCode('new') } })
+    await market.update(PLUGIN, '1.1.0', '1.0.0')
+    await new Promise(resolve => setTimeout(resolve, 600))
+    expect(peer.ctx.plugins.list().find(entry => entry.name === PLUGIN)?.reloadCount).toBe(1)
+    expect(globalThis.__marketTest.filter(event => event === 'new:0')).toHaveLength(1)
+  })
+
+  it('honors disabling an entry while its shared update is waiting for disposal', async () => {
+    publishPlugin(PLUGIN, {}, '1.0.0', { files: { 'index.js': `
+      export function apply(ctx) {
+        ctx.effect(() => async () => {
+          globalThis.__marketTest.push('stopping')
+          await new Promise(resolve => globalThis.__marketStop = resolve)
+        })
+      }
+    ` } })
+    await market.install(PLUGIN)
+    const peer = await peerInstance('stopped-instance')
+    const other = peer.ctx.plugins.list().find(entry => entry.name === PLUGIN)!
+    await peer.ctx.plugins.enable(other.id, { trust: true })
+    publishPlugin(PLUGIN, {}, '1.1.0', { files: { 'index.js': coordinatedCode('new') } })
+    const update = market.update(PLUGIN, '1.1.0', '1.0.0')
+    await vi.waitFor(() => expect(globalThis.__marketStop).toBeTypeOf('function'))
+    const before = peer.ctx.plugins.list().map(entry => entry.id)
+    await expect(peer.ctx.plugins.add(PLUGIN, {}, { trust: true })).rejects.toThrow(/跨实例更新/)
+    expect(peer.ctx.plugins.list().map(entry => entry.id)).toEqual(before)
+    const disable = peer.ctx.plugins.disable(other.id)
+    await vi.waitFor(() => expect(peer.ctx.plugins.list().find(entry => entry.name === PLUGIN)?.disabled).toBe(true))
+    globalThis.__marketStop!()
+    await Promise.all([update, disable])
+    globalThis.__marketStop = undefined
+    expect(peer.ctx.plugins.list().find(entry => entry.name === PLUGIN)).toMatchObject({ version: '1.1.0', disabled: true, state: 'disposed' })
+    expect(globalThis.__marketTest).not.toContain('new:0')
+  })
+
+  it('removes shared code from every instance but retains another instance configuration', async () => {
+    await market.install(PLUGIN)
+    const peer = await peerInstance('retained-instance')
+    const other = peer.ctx.plugins.list().find(entry => entry.name === PLUGIN)!
+    await peer.ctx.plugins.enable(other.id, { trust: true })
+    const result = await market.uninstall(PLUGIN, { keepConfig: false })
+    expect(result.instances).toContainEqual(expect.objectContaining({ instance: 'retained-instance', status: 'removed' }))
+    expect(peer.ctx.plugins.list().some(entry => entry.name === PLUGIN)).toBe(false)
+    expect(JSON.parse(readFileSync(peer.file, 'utf8')).retained).toEqual([expect.objectContaining({ id: other.id, disabled: true })])
+    expect(JSON.parse(readFileSync(pluginsFile, 'utf8')).retained).toBeUndefined()
+  })
+
+  it('refreshes shared builtin approvals in peers without replacing their live core services', async () => {
+    await setupBuiltin()
+    const peer = await peerInstance('builtin-instance', { builtins: [{
+      name: 'builtin:example', title: '示例内置插件', manifest: {},
+      npm: { name: BUILTIN, version: '1.0.0', abi: 1 },
+      plugin: { apply() { globalThis.__marketTest.push('peer-bundled') } },
+    }] })
+    publishBuiltin('1.1.0')
+    const result = await market.update(BUILTIN, '1.1.0', '1.0.0')
+    expect(result.instances).toContainEqual(expect.objectContaining({ instance: 'builtin-instance', status: 'restart-required' }))
+    expect(peer.market.installed().find(pkg => pkg.name === BUILTIN)).toMatchObject({ version: '1.1.0', activeVersion: '1.0.0', restartRequired: true })
+    expect(globalThis.__marketTest).not.toContain('updated')
+  })
+
+  it('keeps an additional readable plugin directory usable when coordination metadata cannot be written there', async () => {
+    const readOnlyRoot = path.join(path.dirname(pluginRoot), 'read-only')
+    mkdirSync(path.join(readOnlyRoot, 'example'), { recursive: true })
+    writeFileSync(path.join(readOnlyRoot, 'example', 'package.json'), JSON.stringify({
+      name: 'example', version: '1.0.0', main: 'index.js', type: 'module', llbot: {},
+    }))
+    writeFileSync(path.join(readOnlyRoot, 'example', 'index.js'), "export function apply() { globalThis.__marketTest.push('readonly-loaded') }")
+    // An unwritable metadata destination is portable across Windows ACL and Unix permission models.
+    writeFileSync(path.join(readOnlyRoot, '.llbot-packages'), 'metadata unavailable')
+    const peer = await peerInstance('readonly-instance', { roots: [pluginRoot, readOnlyRoot] })
+    const entry = peer.ctx.plugins.list().find(item => item.name === 'example')!
+    await peer.ctx.plugins.enable(entry.id, { trust: true })
+    expect(globalThis.__marketTest).toContain('readonly-loaded')
+    const readonlyMarket = new Market(peer.ctx, new Registry(registry.url), readOnlyRoot)
+    expect(readonlyMarket.installed().find(item => item.name === 'example')?.managed).toBe(false)
+    await expect(readonlyMarket.uninstall('example')).rejects.toThrow(/只读模式/)
+    expect(peer.ctx.plugins.list().find(item => item.id === entry.id)).toMatchObject({ state: 'active', disabled: false })
+  })
+
+  it('returns the whole catalog for the unified list without fetching individual plugin metadata', async () => {
+    await setupBuiltin()
+    publishBuiltin('1.1.0')
+    for (let index = 0; index < 25; index++) publishPlugin(`luckylillia-plugin-full-${index}`)
+    await market.install(PLUGIN, '1.0.0')
+    registry.requests.length = 0
+    const routes = new Hono().route('/api/market', createMarketRoutes(ctx, market))
+    const response = await routes.request('/api/market/catalog')
+    expect(response.status).toBe(200)
+    const { success, data } = await response.json() as { success: boolean; data: { name: string; builtin?: string }[] }
+    expect(success).toBe(true)
+    expect(data).toHaveLength(27)
+    expect(data.find(item => item.name === BUILTIN)).toMatchObject({ name: BUILTIN, builtin: 'builtin:example' })
+    expect(data.find(item => item.name === 'luckylillia-plugin-full-24')).toMatchObject({ name: 'luckylillia-plugin-full-24' })
+    expect(requestsFor(PLUGIN)).toEqual([])
+    expect(tarballRequests()).toEqual([])
+    expect(catalogRequests()).toHaveLength(1)
+  })
+
   it('filters catalog origins before counting and paging, using only registered builtin identities', async () => {
     await setupBuiltin()
     publishBuiltin('1.1.0')
@@ -688,11 +974,93 @@ describe('the market', () => {
     expect([...first.items, ...second.items].every(item => !item.builtin && item.name !== BUILTIN)).toBe(true)
     expect(second.items.some(item => item.name === impostor)).toBe(true)
     expect((await market.search('origin', 1, 'third-party')).total).toBe(25)
-    expect(await market.search('origin', 1, 'builtin')).toEqual({ total: 0, items: [] })
+    expect(await market.search('origin', 1, 'builtin')).toEqual({ total: 0, items: [], categories: emptyCategories })
     const routes = new Hono().route('/api/market', createMarketRoutes(ctx, market))
     const response = await routes.request('/api/market/search?origin=third-party&page=2')
     expect(await response.json()).toMatchObject({ success: true, data: { total: 27, items: second.items.map(item => ({ name: item.name })) } })
     expect((await routes.request('/api/market/search?origin=unrecognized')).status).toBe(400)
+  })
+
+  it('filters every catalog category, treats uncategorized entries as other, and returns all category counts', async () => {
+    const categories: PluginCategory[] = ['protocol', 'adapter', 'chat', 'tool', 'service', 'theme', 'other']
+    for (const category of categories) publishPlugin(`luckylillia-plugin-category-${category}`, {}, '1.0.0', { category })
+    const counts = { protocol: 1, adapter: 1, chat: 1, tool: 1, service: 1, theme: 1, other: 2 }
+    expect(await market.search('', 1)).toMatchObject({ total: 8, categories: counts })
+    for (const category of categories) {
+      const result = await market.search('', 1, 'all', category)
+      const names = [`luckylillia-plugin-category-${category}`]
+      if (category === 'other') names.unshift(PLUGIN)
+      expect(result.items.map(item => item.name)).toEqual(names)
+      expect(result.total).toBe(names.length)
+      expect(result.categories).toEqual(counts)
+    }
+    expect(await market.search('not-in-catalog', 1, 'all', 'chat')).toEqual({ total: 0, items: [], categories: emptyCategories })
+    const routes = new Hono().route('/api/market', createMarketRoutes(ctx, market))
+    expect(await (await routes.request('/api/market/search')).json()).toMatchObject({ success: true, data: { total: 8, categories: counts } })
+    expect(await (await routes.request('/api/market/search?category=all')).json()).toMatchObject({ success: true, data: { total: 8, categories: counts } })
+    expect((await routes.request('/api/market/search?category=unrecognized')).status).toBe(400)
+  })
+
+  it('combines category selection with keywords and origins while keeping counts for the other categories', async () => {
+    await setupBuiltin()
+    publishPlugin(BUILTIN, {}, '1.1.0', { category: 'service', title: '天气内置服务' })
+    const tool = 'luckylillia-plugin-weather-tool'
+    const service = 'luckylillia-plugin-weather-service'
+    publishPlugin(tool, {}, '1.0.0', { category: 'tool', title: '天气工具' })
+    publishPlugin(service, {}, '1.0.0', { category: 'service', title: '天气数据服务' })
+    publishPlugin('luckylillia-plugin-conversation', {}, '1.0.0', { category: 'chat', title: '闲聊助手' })
+    const all = await market.search('天气', 1, 'all', 'service')
+    expect(all.items.map(item => item.name)).toEqual([BUILTIN, service])
+    expect(all).toMatchObject({ total: 2, categories: { ...emptyCategories, tool: 1, service: 2 } })
+    const thirdParty = await market.search('天气', 1, 'third-party', 'service')
+    expect(thirdParty.items.map(item => item.name)).toEqual([service])
+    expect(thirdParty).toMatchObject({ total: 1, categories: { ...emptyCategories, tool: 1, service: 1 } })
+    expect(await market.search('天气', 1, 'builtin', 'tool')).toEqual({
+      total: 0, items: [], categories: { ...emptyCategories, service: 1 },
+    })
+    const routes = new Hono().route('/api/market', createMarketRoutes(ctx, market))
+    const query = new URLSearchParams({ q: '天气', origin: 'third-party', category: 'service' })
+    const response = await routes.request(`/api/market/search?${query}`)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ success: true, data: JSON.parse(JSON.stringify(thirdParty)) })
+  })
+
+  it('filters categories before pagination and counts all matching entries on every page', async () => {
+    const tools: string[] = []
+    for (let index = 0; index < 25; index++) {
+      const name = `luckylillia-plugin-paged-tool-${index}`
+      tools.push(name)
+      publishPlugin(`luckylillia-plugin-paged-service-${index}`, {}, '1.0.0', { category: 'service' })
+      publishPlugin(name, {}, '1.0.0', { category: 'tool' })
+    }
+    const first = await market.search('paged', 1, 'all', 'tool')
+    const second = await market.search('paged', 2, 'all', 'tool')
+    const empty = await market.search('paged', 3, 'all', 'tool')
+    expect(first.items.map(item => item.name)).toEqual(tools.slice(0, 20))
+    expect(second.items.map(item => item.name)).toEqual(tools.slice(20))
+    expect(empty.items).toEqual([])
+    for (const page of [first, second, empty]) {
+      expect(page.total).toBe(25)
+      expect(page.categories).toEqual({ ...emptyCategories, tool: 25, service: 25 })
+    }
+  })
+
+  it('takes categories from the catalog instead of npm manifests or installed plugin metadata', async () => {
+    const categorized = 'luckylillia-plugin-category-source'
+    const uncategorized = 'luckylillia-plugin-category-source-missing'
+    publishPlugin(categorized, {}, '1.0.0', { category: 'tool', llbot: { category: 'chat' } })
+    publishPlugin(uncategorized, {}, '1.0.0', { llbot: { category: 'service' } })
+    const before = await market.search('category-source', 1)
+    expect(before.categories).toEqual({ ...emptyCategories, tool: 1, other: 1 })
+    expect(requestsFor(categorized)).toEqual([])
+    expect(requestsFor(uncategorized)).toEqual([])
+    await market.install(categorized)
+    expect(JSON.parse(readFileSync(path.join(pluginRoot, categorized, 'package.json'), 'utf8')).llbot.category).toBe('chat')
+    const tools = await market.search('category-source', 1, 'all', 'tool')
+    expect(tools.items).toEqual([expect.objectContaining({ name: categorized, category: 'tool', installed: '1.0.0' })])
+    expect(tools.categories).toEqual(before.categories)
+    expect((await market.search('category-source', 1, 'all', 'chat')).items).toEqual([])
+    expect((await market.search('category-source', 1, 'all', 'other')).items.map(item => item.name)).toEqual([uncategorized])
   })
 
   it('lists bundled npm plugins and installs approved updates without replacing the running builtin', async () => {
@@ -1005,6 +1373,33 @@ describe('the market', () => {
     await ctx.plugins.enable(status()!.id, { trust: true })
     expect(globalThis.__marketTest).toEqual(['v1:a1+c1,b1+c2+a1+c1'])
     expect(market.installed()).toEqual([expect.objectContaining({ name: PLUGIN, version: '1.0.0', managed: true })])
+  })
+
+  it('falls back to the next npm mirror when the first cannot be reached', async () => {
+    market = new Market(ctx, new Registries(['http://127.0.0.1:1', registry.url]), pluginRoot)
+    const outcome = await market.install(PLUGIN)
+    expect(outcome).toMatchObject({ name: PLUGIN, version: '1.0.0', packages: 6 })
+    expect(versionAt('node_modules', 'b', 'node_modules', 'c')).toBe('2.0.0')
+  })
+
+  it('takes a catalog version a lagging mirror has not synced yet from the next registry', async () => {
+    const lagging = await startRegistry()
+    try {
+      // The mirror already lists 2.0.0 in its catalog copy but only has 1.0.0 of the package itself
+      lagging.publish(PLUGIN, '1.0.0', { plugin: true, files: { 'index.js': pluginCode('old') } })
+      lagging.pin(PLUGIN, '2.0.0')
+      registry.publish(PLUGIN, '2.0.0', {
+        plugin: true, dependencies: { a: '^1.0.0', b: '^1.0.0' }, files: { 'index.js': pluginCode('v2') },
+      })
+      market = new Market(ctx, new Registries([lagging.url, registry.url]), pluginRoot)
+      expect(await market.install(PLUGIN)).toMatchObject({ name: PLUGIN, version: '2.0.0' })
+      expect(versionAt()).toBe('2.0.0')
+      // Dependencies the mirror does not have at all came from npm too
+      expect(versionAt('node_modules', 'a')).toBe('1.0.0')
+      expect(lagging.requests.some(url => decodeURIComponent(url.pathname) === '/' + PLUGIN)).toBe(true)
+    } finally {
+      await lagging.close()
+    }
   })
 
   it('installs recursive plugin dependencies as separate disabled entries, keeping npm libraries local', async () => {
@@ -1522,7 +1917,7 @@ describe('the market', () => {
     expect(installedVersion(PLUGIN)).toBe('1.0.0')
     expect(market.installed()).toContainEqual(expect.objectContaining({ name: PLUGIN, version: '1.0.0', managed: true }))
     registry.failCatalog()
-    expect(await market.uninstall(PLUGIN)).toEqual({ removed: [id] })
+    expect(await market.uninstall(PLUGIN)).toMatchObject({ removed: [id] })
   })
 
   it('refuses packages that are no plugins and copies it does not manage', async () => {
@@ -1542,12 +1937,98 @@ describe('the market', () => {
     const id = status()!.id
     await ctx.plugins.enable(id, { trust: true })
     await ctx.plugins.setMessageOrder([id])
-    expect(await market.uninstall(PLUGIN)).toEqual({ removed: [id] })
+    expect(await market.uninstall(PLUGIN)).toMatchObject({ removed: [id] })
     expect(status()).toBeUndefined()
     expect(existsSync(dir())).toBe(false)
     // Installed again, it asks for trust again
     expect(JSON.parse(readFileSync(pluginsFile, 'utf8'))).toMatchObject({ trusted: [], messageOrder: [] })
     await expect(market.uninstall(PLUGIN)).rejects.toThrow(/not installed/)
+  })
+
+  it('retains every instance configuration and scope across uninstall, restart and market reinstall', async () => {
+    const name = 'luckylillia-plugin-retained'
+    publishPlugin(name, {}, '1.0.0', { files: { 'index.js': `
+      import Schema from 'schemastery'
+      export const Config = Schema.object({ token: Schema.string().role('secret').default(''), n: Schema.number().default(1) })
+      export function apply() {}
+    ` } })
+    await market.install(name)
+    const first = ctx.plugins.list().find(entry => entry.name === name)!
+    await ctx.plugins.updateConfig(first.id, { token: 'secret-one', n: 7 })
+    await ctx.plugins.setScope(first.id, { platforms: ['qq'], guilds: { mode: 'allow', ids: ['qq:group'] } })
+    await ctx.plugins.enable(first.id, { trust: true })
+    const second = await ctx.plugins.add(name, { token: 'secret-two', n: 9 }, { trust: true })
+    await ctx.plugins.setScope(second.id, { users: { mode: 'deny', ids: ['ntqq:123'] } })
+    await ctx.plugins.setMessageOrder([second.id, first.id])
+    await ctx.plugins.updateUiPrefs({ hide: [`${name}|page|home`], order: { [`${name}|dashboard.cards|card`]: 2 } })
+    const saved = JSON.parse(readFileSync(pluginsFile, 'utf8')).entries.filter((entry: { name: string }) => entry.name === name)
+      .map((entry: object) => ({ ...entry, disabled: true }))
+    const routes = new Hono().route('/api/market', createMarketRoutes(ctx, market))
+    const response = await routes.request('/api/market/uninstall', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, keepConfig: true }),
+    })
+    expect(await response.json()).toMatchObject({ success: true, data: { removed: [first.id, second.id] } })
+    expect(ctx.plugins.list().filter(entry => entry.name === name)).toEqual([])
+    expect(market.installed().some(pkg => pkg.name === name)).toBe(false)
+    expect(existsSync(path.join(pluginRoot, name))).toBe(false)
+    expect(JSON.parse(readFileSync(pluginsFile, 'utf8'))).toMatchObject({
+      entries: [], retained: saved, trusted: [], messageOrder: [], ui: { hidden: [], order: {} },
+    })
+
+    await service!.dispose()
+    ctx = new Context()
+    await ctx.plugin(TimerService)
+    service = await ctx.plugin(PluginService, { file: pluginsFile, roots: [pluginRoot], trust: true })
+    market = new Market(ctx, new Registry(registry.url), pluginRoot)
+    expect(ctx.plugins.list()).toEqual([])
+    const result = await market.install(name)
+    expect(result.entries).toEqual([first.id, second.id])
+    expect(ctx.plugins.list().filter(entry => entry.name === name).map(entry => ({ id: entry.id, disabled: entry.disabled, trusted: entry.trusted })))
+      .toEqual([{ id: first.id, disabled: true, trusted: false }, { id: second.id, disabled: true, trusted: false }])
+    const restored = JSON.parse(readFileSync(pluginsFile, 'utf8'))
+    expect(restored.entries).toEqual(saved)
+    expect(restored.retained).toBeUndefined()
+    await expect(ctx.plugins.enable(first.id)).rejects.toMatchObject({ name: 'Error', message: expect.stringContaining('trust') })
+    const description = await ctx.plugins.describe(first.id)
+    expect(JSON.stringify(description)).not.toContain('secret-one')
+    await ctx.plugins.enable(first.id, { trust: true })
+    expect(ctx.plugins.get(first.id).state).toBe('active')
+  })
+
+  it.each([undefined, false])('removes configs permanently when keepConfig is %s', async keepConfig => {
+    const name = 'luckylillia-plugin-forget-config'
+    publishPlugin(name, {}, '1.0.0', { files: { 'index.js': `
+      import Schema from 'schemastery'
+      export const Config = Schema.object({ value: Schema.string().default('default') })
+      export function apply() {}
+    ` } })
+    await market.install(name)
+    const first = ctx.plugins.list().find(entry => entry.name === name)!
+    await ctx.plugins.updateConfig(first.id, { value: 'erase-me' })
+    await ctx.plugins.setScope(first.id, { platforms: ['ntqq'] })
+    const routes = new Hono().route('/api/market', createMarketRoutes(ctx, market))
+    const response = await routes.request('/api/market/uninstall', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, keepConfig }),
+    })
+    expect(response.status).toBe(200)
+    expect(JSON.parse(readFileSync(pluginsFile, 'utf8')).retained).toBeUndefined()
+    await market.install(name)
+    const current = ctx.plugins.list().find(entry => entry.name === name)!
+    expect(current.id).not.toBe(first.id)
+    expect(current.scope).toBeUndefined()
+    expect((await ctx.plugins.describe(current.id)).effective).toEqual({ value: 'default' })
+  })
+
+  it.each([null, 'true', 0, {}, []])('rejects a non-boolean keepConfig without removing anything: %j', async keepConfig => {
+    await market.install(PLUGIN)
+    const routes = new Hono().route('/api/market', createMarketRoutes(ctx, market))
+    const response = await routes.request('/api/market/uninstall', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: PLUGIN, keepConfig }),
+    })
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({ success: false, message: 'keepConfig must be a boolean' })
+    expect(status()).toBeDefined()
+    expect(existsSync(dir())).toBe(true)
   })
 
   it('answers the WebUI with what went wrong', async () => {
@@ -1575,5 +2056,5 @@ describe('the market', () => {
 })
 
 function readdirNames(dir: string): string[] {
-  return existsSync(dir) ? readdirSync(dir).sort() : []
+  return existsSync(dir) ? readdirSync(dir).filter(name => name !== '.llbot-packages').sort() : []
 }

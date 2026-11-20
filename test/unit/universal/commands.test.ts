@@ -382,10 +382,10 @@ describe('commands', () => {
   it('puts the commands on the menu of the bots that have one, when they come online and after a change', async () => {
     vi.useFakeTimers()
     const menus: string[][] = []
-    const official: Bot = { ...bot, sid: 'qq:A', updateCommands: async (commands: Universal.Command[]) => void menus.push(commands.map(c => c.name)) }
+    const menuBot: Bot = { ...bot, sid: 'test:A', updateCommands: async (commands: Universal.Command[]) => void menus.push(commands.map(c => c.name)) }
     ctx.command('sign', '签到').action(() => {})
     ctx.command('secret', '', { hidden: true }).action(() => {})
-    const protocol = await ctx.plugin({ inject: ['bots'], apply: (ctx: Context) => { ctx.bots.register(official) } })
+    const protocol = await ctx.plugin({ inject: ['bots'], apply: (ctx: Context) => { ctx.bots.register(menuBot) } })
     expect(menus).toEqual([['sign']])
     ctx.command('rank').action(() => {})
     await vi.advanceTimersByTimeAsync(2_000)
@@ -394,6 +394,29 @@ describe('commands', () => {
     await protocol.dispose()
     await vi.advanceTimersByTimeAsync(2_000)
     expect(menus).toEqual([['sign'], ['sign', 'rank']])
+  })
+
+  it('executes QQ commands without publishing them on login, changes or reconnection', async () => {
+    vi.useFakeTimers()
+    const updateCommands = vi.fn(async (_commands: Universal.Command[]) => {})
+    bot = { ...bot, platform: 'qq', sid: 'qq:B', updateCommands }
+    ctx.command('sign', '签到').alias('签到').action(() => 'signed')
+    const protocol = await ctx.plugin({ inject: ['bots'], apply: (ctx: Context) => { ctx.bots.register(bot) } })
+    expect(updateCommands).not.toHaveBeenCalled()
+    await say('/签到')
+    expect(sent).toEqual(['signed'])
+
+    const plugin = await ctx.plugin({ inject: ['commands'], apply: (ctx: Context) => {
+      ctx.command('rank').action(() => 'ranked')
+    } })
+    await vi.advanceTimersByTimeAsync(2_000)
+    await plugin.dispose()
+    await vi.advanceTimersByTimeAsync(2_000)
+    await protocol.dispose()
+    const reconnected = await ctx.plugin({ inject: ['bots'], apply: (ctx: Context) => { ctx.bots.register(bot) } })
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(updateCommands).not.toHaveBeenCalled()
+    await reconnected.dispose()
   })
 
   it('synchronizes an unchanged menu to a new bot instance registered with the same sid', async () => {

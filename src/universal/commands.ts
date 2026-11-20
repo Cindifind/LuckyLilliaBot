@@ -4,6 +4,7 @@ import type {
   Argv, Bot, Command as CommandApi, CommandAction, CommandConfig, CommandInfo, Commands, OptionConfig, Session, Universal,
 } from '@luckylillia/plugin-sdk'
 import type BotsService from './bots'
+import { normalizePlatform, normalizePlatformId } from '../common/platform'
 
 /** The command settings (builtin:commands), changed in place: the service and its commands stay. */
 export interface CommandSettings {
@@ -371,7 +372,8 @@ export class CommandService extends Service implements Commands {
 
   private isOwner(session: Session) {
     const id = session.userId
-    return !!id && this.settings.current.owners.some(owner => owner === id || owner === `${session.platform}:${id}`)
+    const platform = normalizePlatform(session.platform)
+    return !!id && this.settings.current.owners.some(owner => owner === id || normalizePlatformId(owner) === `${platform}:${id}`)
   }
 
   private authority(command: Command): CommandInfo['authority'] {
@@ -418,7 +420,8 @@ export class CommandService extends Service implements Commands {
 
   /** Puts the commands on a bot's menu, unless it has these already. */
   private syncMenu(bot: Bot) {
-    if (!bot.updateCommands) return
+    // QQ menus and panels are managed explicitly, independently of the local command registry.
+    if (bot.platform === 'qq' || !bot.updateCommands) return
     const menu = this.menu()
     const key = JSON.stringify(menu)
     if (this.menus.get(bot.sid) === key) return

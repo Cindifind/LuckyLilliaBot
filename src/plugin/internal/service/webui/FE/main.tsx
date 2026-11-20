@@ -6,7 +6,10 @@ import GlassDebug from './components/common/GlassDebug'
 import { installSharedModules, startBuiltinClients } from './plugin-host'
 import { registerCorePages } from './core'
 import './index.css'
+import { installThemeRuntime } from './plugin-host/themes'
 
+const disposeThemes = installThemeRuntime()
+if (import.meta.hot) import.meta.hot.dispose(disposeThemes)
 installSharedModules()
 registerCorePages()
 startBuiltinClients()

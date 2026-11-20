@@ -108,6 +108,7 @@ export class BuiltinPackages {
     if (!this.store) return
     const { data, error } = await this.store.read()
     if (error) throw new Error(`Cannot read built-in package approvals: ${error}`)
+    this.approved.clear()
     for (const [name, builtin] of this.bundled) {
       const approval = data?.[name]
       if (!approval) continue

@@ -1,8 +1,7 @@
 import path from 'node:path'
 import { installHostLifecycle } from './hostLifecycle'
+import { startupPluginNames, startupPluginError, startRequestedPlugins } from './startupPlugins'
 
-// fluent-ffmpeg 需要用到这个
-globalThis.__dirname = import.meta.dirname
 import Log from './log'
 import { Config as LLBotConfig } from '../common/types'
 import { Context } from 'cordis'
@@ -14,7 +13,7 @@ import { setConfigLogLevel, getLogLevel, bindLoggerFactory, getLogger } from '@/
 import LoggerConsole from '@cordisjs/plugin-logger-console'
 import TimerService from '@cordisjs/plugin-timer'
 import ConfigService from './config'
-import { liftBuiltinSettings, migrateToInstances, renameNativeQQSettings } from './config/migrate'
+import { liftBuiltinSettings, migrateToInstances, renameNativeQQSettings, migrateExtractedPlugins, migrateNTQQMessaging } from './config/migrate'
 import { lockInstance } from './instanceLock'
 import { currentInstance, InstanceChoice } from '@/common/instance'
 import { configPaths } from '@/common/configPaths'
@@ -22,6 +21,7 @@ import PluginService from '../plugin/host'
 import BotsService from '../universal/bots'
 import HttpService from '../universal/http'
 import { builtinPlugins } from '../plugin/internal'
+import { installFFmpegBridge } from '@/common/utils/ffmpeg'
 
 declare module 'cordis' {
   interface Events {
@@ -51,7 +51,8 @@ async function onLoad() {
   }
 
   const ctx = new Context()
-  installHostLifecycle(() => ctx.fiber.dispose(), error => getLogger('main').error(error))
+  installFFmpegBridge(ctx)
+  const stop = installHostLifecycle(() => ctx.fiber.dispose(), error => getLogger('main').error(error))
 
   // Awaited: until their exporters are in, log lines go nowhere (the migration below logs what it moved)
   await ctx.plugin(Log)
@@ -62,6 +63,19 @@ async function onLoad() {
     }
   })
   bindLoggerFactory((name) => ctx.logger(name))
+  const startupFailed = async (error: unknown): Promise<never> => {
+    ctx.logger('main').error(startupPluginError(error))
+    process.exitCode = 1
+    try { await stop() } catch (disposeError) { getLogger('main').error(disposeError) }
+    // A failed headless startup must terminate even if a dependency leaves an unrelated handle alive.
+    process.exit(1)
+  }
+  let requestedPlugins: string[]
+  try {
+    requestedPlugins = startupPluginNames()
+  } catch (error) {
+    return startupFailed(error)
+  }
   // Before the instance is picked: it may create the one `-q` points to (config-storage §9)
   migrateToInstances(ctx.logger('config'))
   let instance: InstanceChoice
@@ -71,18 +85,21 @@ async function onLoad() {
     // Under the lock, so two processes cannot both rewrite this instance's files
     liftBuiltinSettings(ctx.logger('config'))
     renameNativeQQSettings(ctx.logger('config'))
+    migrateExtractedPlugins(ctx.logger('config'))
+    migrateNTQQMessaging(ctx.logger('config'))
   } catch (e) {
     ctx.logger('main').error((e as Error).message)
     process.exit(1)
   }
   ctx.logger('main').info(`实例 ${instance.name}（${instance.reason}），配置在 ${configPaths.instance()}`)
-  ctx.plugin(TimerService)
+  // PluginService injects timer. Cordis await() returns immediately for a PENDING fiber, so make this dependency
+  // active before mounting it; startup --plugin actions must wait for its scan and shared-directory registration.
+  await ctx.plugin(TimerService)
   ctx.plugin(HttpService)
   ctx.plugin(ConfigService)
   ctx.plugin(BotsService)
-  // The WebUI (builtin:webui), the scanned account (builtin:nt-protocol) and the official bot are entries here,
-  // like the adapters
-  ctx.plugin(PluginService, {
+  // Builtins and optional npm protocol/adapter packages share the same entry lifecycle.
+  const plugins = ctx.plugin(PluginService, {
     file: configPaths.plugins(),
     dataDir: configPaths.pluginData(),
     roots: [pluginDir, ...getPluginDirs().map(dir => path.resolve(dir))],
@@ -105,6 +122,15 @@ async function onLoad() {
     // The log file switch is only ever applied from this event
     ctx.parallel('llob/config-updated', config)
   })
+
+  if (requestedPlugins.length) {
+    try {
+      await plugins
+      await startRequestedPlugins(ctx, requestedPlugins)
+    } catch (error) {
+      return startupFailed(error)
+    }
+  }
 
   // 只 log 不退出: 一个 orphaned rejection (如 sendMsg 提前 throw 后 echoP 的 timer) 不该拖垮整个进程
   process.on('unhandledRejection', (reason) => {

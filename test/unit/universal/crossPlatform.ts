@@ -1,7 +1,7 @@
 import h from '@satorijs/element'
 
-// What a plugin may send to any bot. Every platform's tests say what it sends of each (ntqq.test.ts,
-// qqofficial/features.test.ts) and check that they cover all of them; `image` is a picture that platform can reach.
+// Shared extension-element scenarios. Keep the host official-bot tests and the standalone NTQQ tests aligned
+// when adding a new element kind; each package verifies its own native sends and fallbacks.
 
 export function crossPlatform(image: string): Record<string, h[]> {
   return {

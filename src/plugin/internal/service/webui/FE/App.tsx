@@ -9,6 +9,7 @@ import {
 import { iconByName } from './components/plugins/meta';
 import {
   builtinPageKeys, PluginPage, PluginPageHeader, PluginPageUnavailable, usePluginHost, usePluginList, useVisiblePages,
+  SlotOutlet,
 } from './plugin-host';
 import { ResConfig } from './types';
 import { apiFetch, setPasswordPromptHandler } from './utils/api';
@@ -39,6 +40,13 @@ function App() {
   const [passwordError, setPasswordError] = useState('');
   const [passwordResolve, setPasswordResolve] = useState<((value: string) => void) | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [wide, setWide] = useState(() => window.matchMedia('(min-width: 48rem)').matches);
+  useEffect(() => {
+    const media = window.matchMedia('(min-width: 48rem)');
+    const change = () => setWide(media.matches);
+    media.addEventListener('change', change);
+    return () => media.removeEventListener('change', change);
+  }, []);
   const sidebarCollapsed = useLayout(state => state.sidebarCollapsed);
   const setSidebarCollapsed = useLayout(state => state.setSidebarCollapsed);
   usePluginHost(!checkingLogin);
@@ -176,13 +184,17 @@ function App() {
             />
             <span className="font-semibold text-theme">LLBot</span>
           </div>
+          {!wide && currentPluginPage && <div className="ml-auto flex items-center gap-2"><SlotOutlet name="page.header.actions" props={{ page: { key: currentPluginPage.key, owner: currentPluginPage.owner, title: currentPluginPage.title, fullscreen: false } }} /></div>}
         </div>
 
         <div className="p-4 md:p-8 max-w-6xl mx-auto">
           <StatusNotices activeTab={tab} onOpen={setActiveTab} />
           {/* Header - 桌面端显示: the page's own (PageOptions.header), else just room */}
-          <div className="mb-8 hidden md:block">
-            {currentPluginPage && <PluginPageHeader page={currentPluginPage} />}
+          <div className="mb-8 hidden md:flex items-center gap-4">
+            {currentPluginPage && <>
+              <div className="flex-1 min-w-0"><PluginPageHeader page={currentPluginPage} /></div>
+              {wide && <div className="flex items-center gap-2"><SlotOutlet name="page.header.actions" props={{ page: { key: currentPluginPage.key, owner: currentPluginPage.owner, title: currentPluginPage.title, fullscreen: false } }} /></div>}
+            </>}
           </div>
 
           {currentPluginPage ? <PluginPage page={currentPluginPage} /> : <PluginPageUnavailable tab={tab} />}

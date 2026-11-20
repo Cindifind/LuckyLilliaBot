@@ -6,6 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
 import { gunzip } from 'node:zlib'
 import { isInside } from '../../../host/manifest'
+import { recordPackageSwap, recoverPackageSwap } from '../../../host/shared-packages'
 import { matches, PackageVersion, Packument, parseSpec, pickVersion, RegistryClient, type PackageManifest } from './registry'
 import { extractPackage } from './tar'
 import type { LocalPackage } from './archive'
@@ -66,7 +67,7 @@ export class Installer {
   }
 
   /** Lays `main` and its dependencies out in a scratch directory, then swaps it in for what was there. */
-  async install(source: PackageSource): Promise<InstallResult> {
+  async install(source: PackageSource, replace: (apply: () => Promise<void>) => Promise<void> = apply => apply()): Promise<InstallResult> {
     const main = source.manifest
     const target = this.target(main.name)
     if (!target) throw new Error(`invalid package name ${main.name}`)
@@ -84,7 +85,7 @@ export class Installer {
       // Bundled files must be in place before downloaded dependencies, never racing to overwrite them.
       await extract(nodes[0])
       await mapLimit(nodes.slice(1), DOWNLOADS, extract)
-      await this.swap(scratch, target)
+      await replace(() => this.swap(scratch, target))
       return {
         name: main.name,
         version: main.version,
@@ -115,6 +116,7 @@ export class Installer {
   /** What a crash in the middle of an install left behind */
   async cleanup(): Promise<void> {
     if (!existsSync(this.root)) return
+    await recoverPackageSwap(this.root)
     for (const name of await readdir(this.root)) {
       if (name.startsWith(SCRATCH)) await rm(path.join(this.root, name), { recursive: true, force: true }).catch(() => {})
     }
@@ -169,13 +171,15 @@ export class Installer {
         }
         const existing = lookup(node, dep.alias)
         if (existing && existing.source.manifest.name === spec.name && matches(existing.source.manifest.version, spec.range)) continue
-        const version = await packument(spec.name).then(
-          document => pickVersion(document, spec.range),
-          (e) => {
+        const version = await packument(spec.name)
+          // A mirror behind on this package: the registries after it may have a version that fits
+          .then(document => pickVersion(document, spec.range)
+            ?? this.registry.packument(spec.name, false, document => !!pickVersion(document, spec.range))
+              .then(document => pickVersion(document, spec.range)))
+          .catch((e) => {
             if (dep.optional) return undefined
             throw e
-          },
-        )
+          })
         if (!version || !fitsPlatform(version)) {
           if (dep.optional) {
             skipped.push(dep.alias)
@@ -199,6 +203,7 @@ export class Installer {
   private async swap(scratch: string, target: string) {
     await mkdir(path.dirname(target), { recursive: true })
     const old = existsSync(target) ? this.scratch() : undefined
+    await recordPackageSwap(this.root, target, scratch, old)
     if (old) {
       await renamePackage(target, old).catch((e) => {
         throw busy(e, path.basename(target))
@@ -210,7 +215,7 @@ export class Installer {
       if (old) await renamePackage(old, target).catch(() => {})
       throw busy(e, path.basename(target))
     }
-    if (old) await rm(old, { recursive: true, force: true }).catch(() => {})
+    await recoverPackageSwap(this.root)
   }
 
   /** A link (a plugin under development, say) is the user's own: the market neither replaces nor deletes it */

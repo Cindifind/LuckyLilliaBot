@@ -5,7 +5,6 @@ import { WebSocket, WebSocketServer } from 'ws'
 import { implemented, neutralContent, neutralPlatform, toWire } from './wire'
 import type SatoriAdapter from './adapter'
 import { ObjectToSnake } from 'ts-case-convert'
-import { OB11Response } from '@/plugin/internal/adapter/onebot11/action/OB11Response'
 import { Hono, Context as HonoContext, Next } from 'hono'
 import { cors } from 'hono/cors'
 import { serve, ServerType, upgradeWebSocket } from '@hono/node-server'
@@ -26,7 +25,7 @@ export class SatoriServer {
   }
 
   async callOneBot11API(action: string, params: Dict) {
-    const onebotAdapter = this.ctx.get('onebot')
+    const onebotAdapter = this.ctx.get('onebot') ?? this.ctx.get('ntOnebot')
     if (!onebotAdapter) {
       throw new Error(`OB11 service has not started`)
     }
@@ -48,7 +47,8 @@ export class SatoriServer {
     try {
       result = await this.callOneBot11API(action, payload)
     } catch (e) {
-      result = OB11Response.error((e as Error).message, 200)
+      const message = (e as Error).message
+      result = { status: 'failed', retcode: 200, data: null, message, wording: message }
     }
 
     return c.json(result)

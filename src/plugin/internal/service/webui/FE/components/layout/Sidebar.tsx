@@ -2,6 +2,7 @@ import React, { useLayoutEffect, useRef, useState } from 'react'
 import GlassLens from '../common/GlassLens'
 import { X, ChevronLeft, ChevronRight, LucideIcon } from 'lucide-react'
 import AccountsCard from './AccountsCard'
+import { SlotOutlet } from '../../plugin-host/views'
 
 interface SidebarProps {
   activeTab: string;
@@ -97,6 +98,7 @@ const Sidebar: React.FC<SidebarProps> = ({
               </button>
             )}
           </div>
+          <div className="mt-3 empty:hidden"><SlotOutlet name="sidebar.header" /></div>
         </div>
 
         {/* Navigation. One highlight pill slides between items instead of each
@@ -105,8 +107,8 @@ const Sidebar: React.FC<SidebarProps> = ({
           {indicator && (
             <span
               aria-hidden='true'
-              className='absolute left-3 right-3 r-control gradient-primary shadow-[0_6px_16px_-6px_rgba(219,39,119,0.55)] pointer-events-none transition-[top,height] duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]'
-              style={{ top: indicator.top, height: indicator.height }}
+              className='absolute left-3 right-3 r-control gradient-primary pointer-events-none transition-[top,height] duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]'
+              style={{ top: indicator.top, height: indicator.height, boxShadow: '0 6px 16px -6px var(--accent-ring)' }}
             />
           )}
           {menuItems.map((item) => {
@@ -128,6 +130,7 @@ const Sidebar: React.FC<SidebarProps> = ({
           })}
         </nav>
 
+        <div className="px-3 py-2 empty:hidden"><SlotOutlet name="sidebar.footer" /></div>
         <AccountsCard />
       </div>
 

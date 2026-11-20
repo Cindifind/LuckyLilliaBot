@@ -17,6 +17,8 @@ import {
   newEntryId, normalizeUi, PluginEntry, PluginsFile, PluginStore, UiPrefs,
 } from './store'
 import { watchPluginRoots } from './watcher'
+import { SharedPackages, type SharedPackageChange, type SharedPackageResult } from './shared-packages'
+import { removeScannedPackage, scannedPackagePath } from './package-location'
 import { PluginDataDirs } from './storage'
 import { maskSecrets, restoreSecrets, secretPaths } from './secrets'
 import { acceptsScope, EntryScope, normalizeScope } from './scope'
@@ -55,6 +57,8 @@ export interface PluginStatus {
   version?: string
   /** Canonical npm identity, also present for bundled plugins whose stable entry uses builtin:. */
   packageName?: string
+  /** Exact scanned entry which can be removed; linked source repositories are never deleted. */
+  removal?: { path: string; kind: 'directory' | 'link' }
   description?: string
   manifest: LLBotManifest
   disabled: boolean
@@ -89,9 +93,11 @@ export interface PluginStatus {
   trusted?: boolean
   /** package.json `author` */
   author?: PluginAuthor
+  /** Browser URL normalized from package.json `repository`; HTTP(S) only. */
+  repository?: string
   /** URL of the image its package names in `llbot.icon`; absent for a lucide icon */
   iconUrl?: string
-  /** The package declares `llbot.details` or `llbot.screenshots`, which its card offers behind 详情 */
+  /** The package declares local `llbot.details` or `llbot.screenshots` to load when opening 详情. */
   hasDetails?: boolean
 }
 
@@ -291,6 +297,11 @@ class PluginService extends Service {
   // context (cordis tracker), so mounting entries on it would parent them under whoever asked.
   private readonly home: Context
   private readonly dataDirs?: PluginDataDirs
+  private readonly shared: SharedPackages
+  private readonly sharedChanges = new Map<string, SharedPackageChange>()
+  private readonly sharedFinishing = new Set<string>()
+  private readonly sharedWatchUntil = new Map<string, number>()
+  private readonly lifecycle = { closing: false }
 
   constructor(ctx: Context, public config: PluginService.Config) {
     super(ctx, 'plugins')
@@ -301,9 +312,28 @@ class PluginService extends Service {
     this.store = new PluginStore(config.file)
     this.builtins = new Map((config.builtins ?? []).map(builtin => [builtin.name, builtin]))
     this.builtinPackages = new BuiltinPackages(this.builtins.values(), config.roots[0])
+    this.shared = new SharedPackages({
+      roots: config.roots, instance: path.basename(path.dirname(path.resolve(config.file))),
+      prepare: change => this.prepareSharedChange(change),
+      finish: (change, applied) => this.finishSharedChange(change, applied),
+      warn: error => this.home.logger.warn(errorText(error)),
+    })
   }
 
   async [Service.init]() {
+    let dispose: (() => void) | undefined
+    await this.shared.initialize(async () => { dispose = await this.initialize() })
+    return async () => {
+      this.lifecycle.closing = true
+      // A manual reload may already be disposing a fiber no longer present in rt.fiber.
+      await Promise.allSettled([...this.locks.values()])
+      for (const rt of this.runtimes.values()) await this.stop(rt)
+      await this.shared.close()
+      dispose?.()
+    }
+  }
+
+  private async initialize() {
     const disposers: (() => void)[] = []
     this.sdkVersion = hostSdkVersion()
     if (this.config.resolver !== false) {
@@ -422,19 +452,145 @@ class PluginService extends Service {
     return this.sdkVersion
   }
 
+  /** Market serializes every shared write, including startup cleanup, against other processes. */
+  withPackageMutation<T>(root: string, task: () => Promise<T>): Promise<T> {
+    return this.shared.exclusive(root, task)
+  }
+
+  packageRootWritable(root: string): boolean {
+    return this.shared.writable(root)
+  }
+
+  packageRemoval(name: string): PluginStatus['removal'] {
+    const location = this.packages.get(name)?.location
+    if (!location || !this.packageRootWritable(location.root) || this.builtins.has(name) || this.builtinPackages.has(name)) return
+    return { path: scannedPackagePath(location.root, location.directory), kind: location.kind }
+  }
+
+  /** Uninstall the scanned directory (or just its link), coordinating every consumer of this root. */
+  async uninstallPackage(name: string, options: { keepConfig?: boolean } = {}): Promise<{ removed: string[]; instances: SharedPackageResult[] }> {
+    if (this.builtins.has(name) || this.builtinPackages.has(name)) throw new PluginForbiddenError('内置插件不能卸载')
+    const expected = this.packages.get(name)
+    if (!expected) throw new PluginNotFoundError(`${name} is not installed`)
+    const location = expected.location
+    if (!location) throw new PluginForbiddenError('此插件位于链接作用域目录中，请先将插件单独链接到扫描根目录')
+    return this.withPackageMutation(location.root, async () => {
+      await this.scan()
+      const pkg = this.packages.get(name)
+      if (!pkg?.location || !samePath(pkg.root, expected.root) || !samePath(pkg.location.root, location.root)
+        || pkg.location.directory !== location.directory || pkg.location.kind !== location.kind) {
+        throw new PluginForbiddenError('插件目录已变化，请重新扫描后再删除')
+      }
+      const removed = this.entriesOf(name).map(rt => rt.entry.id)
+      const { instances } = await this.changePackage({ root: location.root, name, directory: location.directory,
+        kind: 'uninstall', keepConfig: options.keepConfig }, () => removeScannedPackage(location, pkg.root, name))
+      return { removed, instances }
+    })
+  }
+
+  changePackage<T>(change: Omit<SharedPackageChange, 'id' | 'initiator'>, apply: () => Promise<T>) {
+    return this.shared.change(change, apply)
+  }
+
+  private async prepareSharedChange(change: SharedPackageChange) {
+    if (this.isClosing()) throw new PluginForbiddenError('实例正在停止')
+    const current = this.sharedChanges.get(change.name)
+    if (current && current.id !== change.id) throw new PluginForbiddenError('插件正在另一个实例中更新')
+    if (this.sharedChanges.size && !current) throw new PluginForbiddenError('此实例的另一个插件目录正在更新，请稍后重试')
+    if (this.sharedFinishing.size) throw new PluginForbiddenError('此实例正在完成另一个插件更新，请稍后重试')
+    const pkg = this.packages.get(change.name)
+    const target = scannedPackagePath(change.root, change.directory ?? change.name)
+    const source = change.directory && pkg?.location ? scannedPackagePath(pkg.location.root, pkg.location.directory) : pkg?.root
+    if (pkg && (!source || !samePath(source, target))) throw new PluginForbiddenError(`${change.name} 在此实例使用其他目录中的同名包`)
+    if (change.manifest) {
+      const problem = this.checkBuiltinPackage(change.name, change.manifest)
+        ?? sdkIncompatibility(change.manifest.peerDependencies?.[SDK_PACKAGE], this.sdkVersion)
+      if (problem) throw new PluginForbiddenError(problem)
+      for (const [name, range] of Object.entries(change.manifest.llbot?.dependencies ?? {}) as [string, string][]) {
+        const dependency = this.packages.get(name) ?? this.builtinPackages.list().find(item => item.name === name)
+        if (!dependency || !matchesPluginVersion(dependency.version, range)) {
+          throw new PluginForbiddenError(`${change.name} requires ${name}@${range}; this instance has ${dependency?.version ?? 'no installed version'}`)
+        }
+      }
+      for (const consumer of this.packages.values()) {
+        if (consumer.name === change.name) continue
+        const range = consumer.manifest.dependencies?.[change.name]
+        if (range && !matchesPluginVersion(change.manifest.version, range)) {
+          throw new PluginForbiddenError(`${consumer.name} requires ${change.name}@${range}`)
+        }
+      }
+    }
+    if (!change.builtin && this.entriesOf(change.name).some(rt => !this.isDisabled(rt)) && !this.resolverInstalled) {
+      throw new PluginForbiddenError('此实例无法重新导入插件模块，请先停止插件或升级 Node 后重试')
+    }
+    this.sharedChanges.set(change.name, change)
+    this.sharedWatchUntil.set(target, Infinity)
+    await this.locks.get(SCAN_LOCK)?.catch(() => {})
+    // Already queued operations drain first. Later reloads / enable / scans are refused; disable still works.
+    if (!change.builtin) await this.lock(change.name, async () => {
+      for (const rt of this.entriesOf(change.name)) await this.stop(rt)
+    }, true)
+  }
+
+  private async finishSharedChange(change: SharedPackageChange, applied: boolean): Promise<Omit<SharedPackageResult, 'instance' | 'pid'>> {
+    const prepared = this.sharedChanges.get(change.name)?.id === change.id
+    if (!prepared) return { status: 'unchanged', entries: [] }
+    this.sharedFinishing.add(change.id)
+    this.sharedChanges.delete(change.name)
+    this.sharedWatchUntil.set(scannedPackagePath(change.root, change.directory ?? change.name), Date.now() + 1000)
+    const entries = () => this.entriesOf(change.name).map(rt => rt.entry.id)
+    try {
+      if (this.isClosing()) return { status: 'unchanged', entries: entries(), reason: '实例正在停止，下一次启动时使用已安装版本' }
+      if (change.builtin) {
+        await this.builtinPackages.restore(this.sdkVersion)
+        this.changed()
+        const installed = this.builtinPackages.list().find(item => item.name === change.name)
+        if (installed?.error) throw new Error(installed.error)
+        const needsRestart = installed?.restartRequired
+        return { status: needsRestart ? 'restart-required' : 'unchanged', entries: this.list().filter(item => item.packageName === change.name).map(item => item.id),
+          ...(needsRestart ? { reason: '内置插件更新将在重启 Bot 后生效' } : {}) }
+      }
+      if (applied && change.kind === 'uninstall') {
+        // Only the requesting instance may delete its configuration. Peers retain theirs, switched off.
+        const removed = await this.removePackage(change.name, { keepConfig: change.initiator === this.shared.id ? change.keepConfig : true })
+        await this.scan()
+        return { status: 'removed', entries: removed }
+      }
+      await this.scan()
+      if (!prepared || !this.entriesOf(change.name).some(rt => !this.isDisabled(rt))) return { status: 'unchanged', entries: entries() }
+      await this.lock(change.name, () => this.reloadPackage(change.name))
+      const failure = this.list().find(item => item.name === change.name && !item.disabled && (item.error || item.state === 'failed' || item.state === 'incompatible'))
+      if (failure) throw new Error(failure.error ?? '插件启动失败')
+      await this.reconcilePackageDependencies()
+      return { status: 'reloaded', entries: entries() }
+    } catch (error) {
+      const reason = errorText(error)
+      for (const rt of this.entriesOf(change.name)) if (!this.isDisabled(rt)) {
+        rt.error = `共享插件更新后未能加载：${reason}`
+        this.changed(rt.entry.id)
+      }
+      this.home.logger.warn(`${change.name}: ${reason}`)
+      return { status: 'failed', reason, entries: entries() }
+    } finally {
+      this.sharedFinishing.delete(change.id)
+    }
+  }
+
   scan() {
     return this.lock(SCAN_LOCK, () => this.rescan())
   }
 
   async add(name: string, config?: unknown, options: { trust?: boolean } = {}): Promise<PluginStatus> {
     if (this.builtins.has(name)) throw new PluginForbiddenError(`${name} is builtin and runs as a single instance`)
-    if (!this.packages.has(name)) throw new PluginNotFoundError(`no plugin package named ${name}`)
-    this.assertTrusted(name, options.trust)
-    const rt = this.createEntry(name, false, config)
-    await this.save()
-    this.changed()
-    await this.lock(name, () => this.start(rt))
-    return this.status(rt)
+    return this.lock(name, async () => {
+      if (!this.packages.has(name)) throw new PluginNotFoundError(`no plugin package named ${name}`)
+      this.assertTrusted(name, options.trust)
+      const rt = this.createEntry(name, false, config)
+      await this.save()
+      this.changed()
+      await this.start(rt)
+      return this.status(rt)
+    })
   }
 
   async remove(id: string): Promise<void> {
@@ -450,24 +606,61 @@ class PluginService extends Service {
     this.changed()
   }
 
+  /** Remove every runtime entry, optionally keeping its raw configuration for a later installation. */
+  removePackage(name: string, options: { keepConfig?: boolean; missingOnly?: boolean } = {}): Promise<string[]> {
+    if (this.builtins.has(name) || this.builtinPackages.has(name)) {
+      throw new PluginForbiddenError(`${name} is builtin and cannot be removed`)
+    }
+    return this.lock(name, async () => {
+      if (options.missingOnly && this.packages.has(name)) {
+        throw new PluginForbiddenError('插件文件已恢复，请刷新列表后卸载')
+      }
+      const runtimes = this.entriesOf(name)
+      for (const rt of runtimes) await this.stop(rt)
+      const removed = runtimes.map(rt => rt.entry.id)
+      const ids = new Set(removed)
+      const retained = (this.data.retained ?? []).filter(entry => entry.name !== name)
+      if (options.keepConfig) {
+        // Never retain the masked values returned by describe()/the WebUI, or mutable disposed runtimes.
+        retained.push(...runtimes.map(rt => ({ ...structuredClone(rt.entry), disabled: true })))
+      }
+      if (retained.length) this.data.retained = retained
+      else delete this.data.retained
+      for (const id of removed) this.runtimes.delete(id)
+      this.data.entries = this.data.entries.filter(entry => !ids.has(entry.id))
+      if (this.data.messageOrder) this.data.messageOrder = this.data.messageOrder.filter(id => !ids.has(id))
+      this.clearPackageApprovals(name)
+      // Entries, retained configs and removed trust are committed together in the instance's plugins.json.
+      await this.save()
+      this.ctx.emit('plugins/ui', this.uiPrefs())
+      this.changed()
+      return removed
+    })
+  }
+
   /**
    * Drops a package's trust and the positions and visibility of its WebUI contributions. For
    * a package that is gone: installing it again asks again.
    */
   async forget(name: string): Promise<void> {
+    if (!this.clearPackageApprovals(name)) return
+    await this.save()
+    this.ctx.emit('plugins/ui', this.uiPrefs())
+    this.changed()
+  }
+
+  private clearPackageApprovals(name: string): boolean {
     const ui = this.data.ui
     const prefix = `${name}|`
     const granted = this.data.trusted?.includes(name)
       || ui?.hidden.some(key => key.startsWith(prefix)) || Object.keys(ui?.order ?? {}).some(key => key.startsWith(prefix))
-    if (!granted) return
+    if (!granted) return false
     if (this.data.trusted) this.data.trusted = this.data.trusted.filter(item => item !== name)
     if (ui) {
       ui.hidden = ui.hidden.filter(key => !key.startsWith(prefix))
       for (const key of Object.keys(ui.order)) if (key.startsWith(prefix)) delete ui.order[key]
     }
-    await this.save()
-    this.ctx.emit('plugins/ui', this.uiPrefs())
-    this.changed()
+    return true
   }
 
   /**
@@ -476,8 +669,8 @@ class PluginService extends Service {
    */
   async enable(id: string, options: { rules?: boolean; trust?: boolean } = {}): Promise<PluginStatus> {
     const rt = this.runtime(id)
-    this.assertTrusted(rt.entry.name, options.trust)
     return this.lock(rt.entry.name, async () => {
+      this.assertTrusted(rt.entry.name, options.trust)
       if (this.isDisabled(rt)) {
         // A config saved while switched off must not get past a security rule this way
         const builtin = this.builtins.get(rt.entry.name)
@@ -544,11 +737,13 @@ class PluginService extends Service {
     if (this.builtins.get(rt.entry.name)?.core) {
       throw new PluginForbiddenError(`${rt.entry.name} is part of the bot core and cannot be disabled`)
     }
+    // Record a stop immediately during coordination so finish cannot resurrect the entry.
+    if (this.sharedChanges.has(rt.entry.name)) await this.setDisabled(rt, true)
     return this.lock(rt.entry.name, async () => {
       await this.setDisabled(rt, true)
       await this.stop(rt)
       return this.status(rt)
-    })
+    }, true)
   }
 
   /**
@@ -610,6 +805,22 @@ class PluginService extends Service {
     if (!builtin?.config || !rt) return
     const { node, defaults } = this.configModel(builtin.plugin.Config)
     return { id: rt.entry.id, enabled: !this.isDisabled(rt), config: withDefaults(node, rt.entry.config ?? null, defaults) }
+  }
+
+  /**
+   * Synchronous compatibility view of the first entry for a package. A read never imports a plugin:
+   * use its already loaded schema, or only its stored config while it is disabled/missing/untrusted.
+   * Legacy adapter sections are single-entry views; multiple entries are managed through the plugin API.
+   */
+  entrySettings(name: string): { id: string; enabled: boolean; trusted: boolean; config: unknown } | undefined {
+    const rt = this.entriesOf(name)[0]
+    if (!rt) return
+    const builtin = this.builtins.get(name)
+    if (builtin && !builtin.config) return
+    const Config = builtin?.plugin.Config ?? this.modules.get(name)?.plugin?.Config
+    const { node, defaults } = this.configModel(Config)
+    return { id: rt.entry.id, enabled: !this.isDisabled(rt), trusted: this.isTrusted(name),
+      config: structuredClone(withDefaults(node, rt.entry.config ?? null, defaults)) }
   }
 
   async reload(id: string): Promise<ReloadResult> {
@@ -867,7 +1078,7 @@ class PluginService extends Service {
       })
       .map(pkg => pkg.name)
     // An edit of what the WebUI shows (title, icon, details) needs no reload, but the list goes out again
-    const shown = (pkg: PluginPackage) => JSON.stringify([pkg.manifest, pkg.description, pkg.author, pkg.iconFile, pkg.detailsFile, pkg.screenshots])
+    const shown = (pkg: PluginPackage) => JSON.stringify([pkg.manifest, pkg.description, pkg.author, pkg.repository, pkg.iconFile, pkg.detailsFile, pkg.screenshots, pkg.location])
     const edited = [...next.values()].some(pkg => {
       const old = this.packages.get(pkg.name)
       return old && shown(old) !== shown(pkg)
@@ -886,7 +1097,19 @@ class PluginService extends Service {
     let created = false
     for (const name of added) {
       if (this.entriesOf(name).length) continue
-      this.createEntry(name, true)
+      const retained = this.data.retained?.filter(entry => entry.name === name) ?? []
+      if (retained.length) {
+        for (const saved of retained) {
+          const entry: PluginEntry = { ...saved, disabled: true }
+          if (this.runtimes.has(entry.id)) entry.id = newEntryId(this.reservedEntryIds())
+          this.data.entries.push(entry)
+          this.runtimes.set(entry.id, { entry, reloadCount: 0 })
+        }
+        const remaining = this.data.retained!.filter(entry => entry.name !== name)
+        if (remaining.length) this.data.retained = remaining
+        else delete this.data.retained
+        this.clearPackageApprovals(name)
+      } else this.createEntry(name, true)
       created = true
     }
     if (created) await this.save()
@@ -918,6 +1141,8 @@ class PluginService extends Service {
   }
 
   private async start(rt: Runtime) {
+    if (this.isClosing()) return
+    if (this.sharedChanges.has(rt.entry.name)) return
     if (this.isDisabled(rt) || rt.fiber || !this.runtimes.has(rt.entry.id)) return
     const builtin = this.builtins.get(rt.entry.name)
     if (builtin) {
@@ -944,6 +1169,7 @@ class PluginService extends Service {
   }
 
   private mount(rt: Runtime, plugin: Plugin): Fiber | undefined {
+    if (this.isClosing() || this.sharedChanges.has(rt.entry.name)) return
     // The package list may have changed while its module was being imported. Reloads use this gate too.
     if (this.packageBlock(rt)) {
       rt.packageBlocked = true
@@ -1042,6 +1268,7 @@ class PluginService extends Service {
     const known = this.packages.get(name)
     if (!known) throw new PluginNotFoundError(`plugin package ${name} is not installed`)
     const pkg = (await readPluginPackage(known.root)) ?? known
+    pkg.location = known.location
     this.packages.set(name, pkg)
     this.bumpWebui(name)
     const targets = this.entriesOf(name).filter(rt => !this.isDisabled(rt))
@@ -1106,6 +1333,7 @@ class PluginService extends Service {
       name: entry.name,
       version: pkg?.version ?? builtin?.npm?.version,
       packageName: builtin?.npm?.name ?? pkg?.name,
+      removal: !builtin ? this.packageRemoval(entry.name) : undefined,
       description: pkg?.description,
       manifest: builtin?.manifest ?? pkg?.manifest ?? {},
       disabled: this.isDisabled(rt),
@@ -1117,6 +1345,7 @@ class PluginService extends Service {
       webui: pkg?.webui && webuiUrl(pkg, this.webuiVersions.get(pkg.name) ?? 0),
     }
     if (pkg?.author) status.author = pkg.author
+    if (pkg?.repository) status.repository = pkg.repository
     if (pkg?.iconFile) status.iconUrl = assetUrl(pkg, pkg.iconFile)
     if (pkg?.detailsFile || pkg?.screenshots.length) status.hasDetails = true
     if (entry.scope) status.scope = entry.scope
@@ -1301,10 +1530,12 @@ class PluginService extends Service {
   }
 
   private async onPackageChanged(dir: string) {
+    if ([...this.sharedWatchUntil].some(([root, until]) => samePath(root, dir) && until > Date.now())) return
     await this.scan()
     const root = await realpath(dir).catch(() => path.resolve(dir))
     const pkg = [...this.packages.values()].find(pkg => pkg.root === root)
     if (!pkg) return
+    if (this.sharedChanges.has(pkg.name) || [...this.sharedWatchUntil].some(([root, until]) => samePath(root, dir) && until > Date.now())) return
     if (!this.entriesOf(pkg.name).some(rt => !this.isDisabled(rt))) {
       this.modules.delete(pkg.name)
       return
@@ -1318,13 +1549,17 @@ class PluginService extends Service {
   }
 
   private createEntry(name: string, disabled: boolean, config?: unknown): Runtime {
-    const entry: PluginEntry = { id: newEntryId(new Set(this.runtimes.keys())), name }
+    const entry: PluginEntry = { id: newEntryId(this.reservedEntryIds()), name }
     if (disabled) entry.disabled = true
     if (config !== undefined) entry.config = config
     this.data.entries.push(entry)
     const rt: Runtime = { entry, reloadCount: 0 }
     this.runtimes.set(entry.id, rt)
     return rt
+  }
+
+  private reservedEntryIds(): Set<string> {
+    return new Set([...this.runtimes.keys(), ...this.data.retained?.map(entry => entry.id) ?? []])
   }
 
   private entriesOf(name: string): Runtime[] {
@@ -1339,10 +1574,21 @@ class PluginService extends Service {
     this.ctx.emit('plugins/changed', id)
   }
 
+  private isClosing() {
+    return this.lifecycle.closing || this.home.fiber.state === FiberState.UNLOADING || this.home.fiber.state === FiberState.DISPOSED
+  }
+
   /** Serializes work per key so watcher reloads cannot interleave with WebUI actions. */
-  private lock<T>(key: string, task: () => Promise<T>): Promise<T> {
+  private lock<T>(key: string, task: () => Promise<T>, coordinated = false): Promise<T> {
+    if (this.isClosing()) return Promise.reject(new PluginForbiddenError('实例正在停止'))
+    const blocked = () => !coordinated && (this.sharedChanges.has(key) || key === SCAN_LOCK && this.sharedChanges.size)
+    if (blocked()) return Promise.reject(new PluginForbiddenError('插件正在跨实例更新，请稍后重试'))
+    const run = () => {
+      if (blocked()) throw new PluginForbiddenError('插件正在跨实例更新，请稍后重试')
+      return task()
+    }
     const previous = this.locks.get(key) ?? Promise.resolve()
-    const current = previous.then(task, task)
+    const current = previous.then(run, run)
     this.locks.set(key, current.catch(() => {}))
     return current
   }
@@ -1429,6 +1675,10 @@ function bundlesOwnCordis(plugin: Plugin): boolean {
 function errorText(error: unknown): string {
   if (error instanceof AggregateError) return error.errors.map(errorText).join('; ')
   return error instanceof Error ? error.message : String(error)
+}
+
+function samePath(a: string, b: string): boolean {
+  return process.platform === 'win32' ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b)
 }
 
 export default PluginService

@@ -1,17 +1,19 @@
 import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
+import { createJSONStorage, persist } from 'zustand/middleware'
 
-type ThemeMode = 'light' | 'dark' | 'auto'
+import type { ThemeMode } from '@luckylillia/plugin-sdk/webui'
 
 interface ThemeState {
   mode: ThemeMode
   isDark: boolean // 解析 auto 之后的结果
+  selected: string
+  select: (key: string) => void
   setMode: (mode: ThemeMode) => void
   cycleMode: () => void
 }
 
 const getSystemTheme = (): boolean => {
-  return window.matchMedia('(prefers-color-scheme: dark)').matches
+  return typeof window !== 'undefined' && !!window.matchMedia?.('(prefers-color-scheme: dark)').matches
 }
 
 const resolveTheme = (mode: ThemeMode): boolean => {
@@ -22,6 +24,7 @@ const resolveTheme = (mode: ThemeMode): boolean => {
 }
 
 const applyTheme = (isDark: boolean) => {
+  if (typeof document === 'undefined') return
   if (isDark) {
     document.documentElement.classList.add('dark')
   } else {
@@ -34,6 +37,8 @@ export const useThemeStore = create<ThemeState>()(
     (set, get) => ({
       mode: 'auto',
       isDark: getSystemTheme(),
+      selected: 'default',
+      select: selected => set({ selected }),
       setMode: (mode: ThemeMode) => {
         const isDark = resolveTheme(mode)
         applyTheme(isDark)
@@ -51,9 +56,12 @@ export const useThemeStore = create<ThemeState>()(
     }),
     {
       name: 'llbot-theme',
-      partialize: (state) => ({ mode: state.mode }),
+      storage: createJSONStorage(() => localStorage),
+      partialize: (state) => ({ mode: state.mode, selected: state.selected }),
       onRehydrateStorage: () => (state) => {
         if (state) {
+          if (!['light', 'dark', 'auto'].includes(state.mode)) state.mode = 'auto'
+          if (typeof state.selected !== 'string' || !state.selected) state.selected = 'default'
           const isDark = resolveTheme(state.mode)
           applyTheme(isDark)
           state.isDark = isDark
@@ -63,7 +71,7 @@ export const useThemeStore = create<ThemeState>()(
   )
 )
 
-if (typeof window !== 'undefined') {
+if (typeof window !== 'undefined' && window.matchMedia) {
   const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
   mediaQuery.addEventListener('change', (e) => {
     const state = useThemeStore.getState()

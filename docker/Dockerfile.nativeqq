@@ -11,3 +11,4 @@ RUN chmod +x /startup.sh
 ENV PROTOCOL_MODE=nativeqq
 VOLUME ["/app/llbot/data", "/root/.config/QQ"]
 ENTRYPOINT ["/startup.sh"]
+CMD []

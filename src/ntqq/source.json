@@ -1,0 +1,5 @@
+{
+  "package": "@luckylillia/plugin-nt-protocol",
+  "version": "1.0.1",
+  "note": "Public API and declarations only. Native, login, sessions and account services are supplied by the installed plugin."
+}

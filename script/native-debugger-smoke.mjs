@@ -11,6 +11,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { setTimeout as delay } from 'node:timers/promises'
+import { defaultNTQQPlugin, exposeNTQQPlugin, nativeBundleRoot, ntqqPackage } from './ntqq-smoke-plugin.mjs'
 
 const botRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const require = createRequire(import.meta.url)
@@ -38,12 +39,12 @@ const qqMainPids = () => {
 function options(argv) {
   const result = {
     uin: process.env.LLBOT_SMOKE_UIN || '',
-    dist: path.join(botRoot, 'dist'),
+    dist: path.join(botRoot, 'dist'), pluginDir: defaultNTQQPlugin(botRoot),
     tokenFile: path.resolve(botRoot, '../LuckyLillia.node/data/auth_token.txt'),
     qqPath: '', timeoutMs: 180_000, expectedBuildId: '', prepareOnly: false,
   }
   const names = new Map([
-    ['--uin', 'uin'], ['-q', 'uin'], ['--dist', 'dist'], ['--auth-token-file', 'tokenFile'],
+    ['--uin', 'uin'], ['-q', 'uin'], ['--dist', 'dist'], ['--plugin-dir', 'pluginDir'], ['--auth-token-file', 'tokenFile'],
     ['--qq-path', 'qqPath'], ['--timeout-ms', 'timeoutMs'], ['--expected-build-id', 'expectedBuildId'],
   ])
   for (let index = 0; index < argv.length; index++) {
@@ -61,7 +62,7 @@ function options(argv) {
   check(/^[1-9][0-9]*$/.test(result.uin), 'EXPECTED_UIN_REQUIRED')
   result.timeoutMs = Number(result.timeoutMs)
   check(Number.isSafeInteger(result.timeoutMs) && result.timeoutMs >= 20_000 && result.timeoutMs <= 600_000, 'INVALID_TIMEOUT')
-  for (const key of ['dist', 'tokenFile']) result[key] = path.resolve(result[key])
+  for (const key of ['dist', 'tokenFile', 'pluginDir']) result[key] = path.resolve(result[key])
   if (result.qqPath) {
     result.qqPath = path.resolve(result.qqPath)
     check(existsSync(result.qqPath), 'QQ_EXECUTABLE_NOT_FOUND')
@@ -69,8 +70,8 @@ function options(argv) {
   return result
 }
 
-function inspectNative(dist, expectedBuildId) {
-  const bundleRoot = path.join(dist, 'native')
+function inspectNative(dist, expectedBuildId, pluginDir) {
+  const bundleRoot = nativeBundleRoot(pluginDir)
   check(existsSync(path.join(dist, 'llbot.js')), 'BUILT_BOT_NOT_FOUND')
   check(existsSync(path.join(bundleRoot, 'loader.cjs')), 'BUILT_NATIVE_LOADER_NOT_FOUND')
   const loader = require(path.join(bundleRoot, 'loader.cjs'))
@@ -78,12 +79,6 @@ function inspectNative(dist, expectedBuildId) {
   check(bundle.manifest.variant === 'production', 'NATIVE_VARIANT_NOT_PRODUCTION')
   check(bundle.target === 'win-x64', 'NATIVE_TARGET_NOT_WINDOWS_X64')
   if (expectedBuildId) check(bundle.metadata.buildId === expectedBuildId, 'NATIVE_BUILD_ID_MISMATCH')
-  // Catch the common error of syncing the fixed addon but running an old dist/.
-  const sourceRoot = path.join(botRoot, 'src/native/production')
-  if (existsSync(path.join(sourceRoot, 'loader.cjs'))) {
-    const source = require(path.join(sourceRoot, 'loader.cjs')).inspectBundle(sourceRoot)
-    check(source.metadata.buildId === bundle.metadata.buildId, 'BUILT_NATIVE_IS_STALE')
-  }
   return { buildId: bundle.metadata.buildId, target: bundle.target, version: bundle.metadata.package.version, variant: bundle.manifest.variant }
 }
 
@@ -104,15 +99,15 @@ function prepareWorkspace(config) {
   writeFileSync(path.join(instanceDir, 'webui_token.txt'), webuiPassword, 'utf8')
   json(path.join(instanceDir, 'settings.json'), { log: false, logLevel: 'info',
     webui: { enable: true, host: '127.0.0.1', port: 0 }, msgCacheExpire: 120 })
-  const optional = ['dashboard', 'logs', 'onebot11', 'satori', 'milky', 'qq-official', 'webqq', 'email-notification']
-  json(path.join(instanceDir, 'plugins.json'), { version: 1, hmr: false, entries: [
-    { id: 'smoke-nt', name: 'builtin:nt-protocol', config: { mode: 'nativeqq', protocol: 'linux', nativeQQ: { qqPath: config.qqPath } } },
+  const optional = ['dashboard', 'logs', 'satori', 'qq-official', 'webqq', 'email-notification']
+  json(path.join(instanceDir, 'plugins.json'), { version: 1, hmr: false, trusted: [ntqqPackage], entries: [
+    { id: 'smoke-nt', name: ntqqPackage, config: { mode: 'nativeqq', protocol: 'linux', nativeQQ: { qqPath: config.qqPath } } },
     ...optional.map(name => ({ id: `smoke-${name}`, name: `builtin:${name}`, disabled: true })),
     // The host requires these core services.
     { id: 'smoke-webui', name: 'builtin:webui' },
     { id: 'smoke-universal', name: 'builtin:ntqq-universal' },
   ] })
-  return { directory, nativeConfig, instance, webuiHash: createHash('sha256').update(webuiPassword).digest('hex'),
+  return { directory, pluginRoot: exposeNTQQPlugin(directory, config.pluginDir), nativeConfig, instance, webuiHash: createHash('sha256').update(webuiPassword).digest('hex'),
     metadataLog: path.join(directory, 'smoke-metadata.jsonl') }
 }
 
@@ -177,11 +172,11 @@ function sampleMetadata(info, qqPid, observations) {
 async function main() {
   const config = options(process.argv.slice(2))
   if (config.help) {
-    console.log('Usage: node script/native-debugger-smoke.mjs --uin <QQ> [--qq-path <exe>] [--auth-token-file <file>] [--dist <dir>] [--expected-build-id <id>] [--timeout-ms <20000..600000>] [--prepare-only]\nUIN may also come from LLBOT_SMOKE_UIN. Tests built dist/llbot.js, waits 10 seconds of stable identity, then has Bot shut itself down and checks that QQ stays up. Output contains metadata only.')
+    console.log('Usage: node script/native-debugger-smoke.mjs --uin <QQ> [--qq-path <exe>] [--auth-token-file <file>] [--dist <dir>] [--plugin-dir <built NTQQ package>] [--expected-build-id <id>] [--timeout-ms <20000..600000>] [--prepare-only]\nUIN may also come from LLBOT_SMOKE_UIN. Tests built dist/llbot.js, waits 10 seconds of stable identity, then has Bot shut itself down and checks that QQ stays up. Output contains metadata only.')
     return
   }
   check(process.platform === 'win32' && process.arch === 'x64', 'WINDOWS_X64_REQUIRED')
-  const native = inspectNative(config.dist, config.expectedBuildId)
+  const native = inspectNative(config.dist, config.expectedBuildId, config.pluginDir)
   const workspace = prepareWorkspace(config)
   const started = Date.now()
   const emit = (event, data = {}) => {
@@ -202,7 +197,7 @@ async function main() {
     if (/^(NODE_OPTIONS|AUTH_TOKEN|LLBOT_INSTANCE|LLBOT_WEBUI_.*|LLBOT_LOG_LEVEL|PROTOCOL_MODE|PROTOCOL)$/i.test(name)) delete environment[name]
   }
   Object.assign(environment, { AUTH_TOKEN: token, LLBOT_LOG_LEVEL: 'info', NO_COLOR: '1' })
-  const child = spawn(process.execPath, [path.join(config.dist, 'llbot.js'), `--parent-pid=${keeper.pid}`, '--instance', workspace.instance, '--nativeqq', '--nativeqq-config', workspace.nativeConfig, '-q', config.uin],
+  const child = spawn(process.execPath, [path.join(config.dist, 'llbot.js'), `--parent-pid=${keeper.pid}`, '--instance', workspace.instance, '--plugin-dir', workspace.pluginRoot, '--nativeqq', '--nativeqq-config', workspace.nativeConfig, '-q', config.uin],
     { cwd: workspace.directory, env: environment, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
   // Retain the token only in the redactor closure and the already-spawned child's environment.
   delete environment.AUTH_TOKEN

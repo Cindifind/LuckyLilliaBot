@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from 'react'
 import { useThemeStore } from '../../stores/themeStore'
 import { glassFrame, resetGlassAdaptive, setGlassSource } from '../../utils/glassRuntime'
+import { useTheme } from '../../plugin-host/themes'
 
 /*
  * The wallpaper: a base gradient with a light source and a few very large, very soft colour fields drifting
@@ -94,7 +95,7 @@ function paintBase(ctx: CanvasRenderingContext2D, w: number, h: number, dark: bo
   ctx.fillRect(0, 0, w, h)
 }
 
-const AnimatedBackground: React.FC = () => {
+const DefaultBackground: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const blobsRef = useRef<Blob[]>([])
   const animationRef = useRef<number | undefined>(undefined)
@@ -278,6 +279,13 @@ const AnimatedBackground: React.FC = () => {
       className='fixed inset-0 h-full w-full pointer-events-none will-change-transform'
       style={{ zIndex: 0 }}
     />
+  )
+}
+
+const AnimatedBackground: React.FC = () => {
+  const { background } = useTheme()
+  return background === undefined ? <DefaultBackground /> : (
+    <div data-theme-background aria-hidden="true" className="fixed inset-0 pointer-events-none" style={{ background, backgroundSize: 'cover', backgroundPosition: 'center', zIndex: 0 }} />
   )
 }
 

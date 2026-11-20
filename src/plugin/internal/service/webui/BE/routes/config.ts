@@ -7,7 +7,7 @@ import { isDockerEnvironment } from '@/common/utils/environment'
 import { Hono } from 'hono'
 import { webuiTokenUtil } from '../../../../../../main/config'
 import { applyLegacyConfig } from '../../../../../../main/config/legacyConfig'
-import { PluginConfigError } from '../../../../../host'
+import { PluginConfigError, PluginTrustRequiredError } from '../../../../../host'
 
 export function createConfigRoutes(ctx: Context): Hono {
   const router = new Hono()
@@ -65,6 +65,7 @@ export function createConfigRoutes(ctx: Context): Hono {
       return c.json({ success: true, message: '配置保存成功' })
     } catch (e) {
       if (e instanceof PluginConfigError) return c.json({ success: false, message: e.message }, 400)
+      if (e instanceof PluginTrustRequiredError) return c.json({ success: false, message: e.message, data: { package: e.pkg } }, 428)
       return c.json({ success: false, message: '保存配置失败', error: e }, 500)
     }
   })
