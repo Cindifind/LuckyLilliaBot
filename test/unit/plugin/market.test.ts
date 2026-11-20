@@ -16,7 +16,7 @@ import { createMarketRoutes, Market, MarketError } from '@/plugin/internal/tool/
 import { readLocalPackage as readArchive } from '@/plugin/internal/tool/market/archive'
 import { Catalog } from '@/plugin/internal/tool/market/catalog'
 import {
-  matches, PackageVersion, Packument, parseSpec, pickVersion, Registry, verify,
+  matches, PackageVersion, Packument, parseSpec, pickVersion, Registries, Registry, verify,
 } from '@/plugin/internal/tool/market/registry'
 import { extractPackage, readTar, readTarStream } from '@/plugin/internal/tool/market/tar'
 import { startRequestedPlugins } from '@/main/startupPlugins'
@@ -1373,6 +1373,33 @@ describe('the market', () => {
     await ctx.plugins.enable(status()!.id, { trust: true })
     expect(globalThis.__marketTest).toEqual(['v1:a1+c1,b1+c2+a1+c1'])
     expect(market.installed()).toEqual([expect.objectContaining({ name: PLUGIN, version: '1.0.0', managed: true })])
+  })
+
+  it('falls back to the next npm mirror when the first cannot be reached', async () => {
+    market = new Market(ctx, new Registries(['http://127.0.0.1:1', registry.url]), pluginRoot)
+    const outcome = await market.install(PLUGIN)
+    expect(outcome).toMatchObject({ name: PLUGIN, version: '1.0.0', packages: 6 })
+    expect(versionAt('node_modules', 'b', 'node_modules', 'c')).toBe('2.0.0')
+  })
+
+  it('takes a catalog version a lagging mirror has not synced yet from the next registry', async () => {
+    const lagging = await startRegistry()
+    try {
+      // The mirror already lists 2.0.0 in its catalog copy but only has 1.0.0 of the package itself
+      lagging.publish(PLUGIN, '1.0.0', { plugin: true, files: { 'index.js': pluginCode('old') } })
+      lagging.pin(PLUGIN, '2.0.0')
+      registry.publish(PLUGIN, '2.0.0', {
+        plugin: true, dependencies: { a: '^1.0.0', b: '^1.0.0' }, files: { 'index.js': pluginCode('v2') },
+      })
+      market = new Market(ctx, new Registries([lagging.url, registry.url]), pluginRoot)
+      expect(await market.install(PLUGIN)).toMatchObject({ name: PLUGIN, version: '2.0.0' })
+      expect(versionAt()).toBe('2.0.0')
+      // Dependencies the mirror does not have at all came from npm too
+      expect(versionAt('node_modules', 'a')).toBe('1.0.0')
+      expect(lagging.requests.some(url => decodeURIComponent(url.pathname) === '/' + PLUGIN)).toBe(true)
+    } finally {
+      await lagging.close()
+    }
   })
 
   it('installs recursive plugin dependencies as separate disabled entries, keeping npm libraries local', async () => {

@@ -12,8 +12,8 @@ import { SHARED_SPECIFIERS } from '../../../host/resolve-hook'
 import { Catalog, type CatalogEntry, type CatalogSnapshot } from './catalog'
 import { ArchiveError, readLocalPackage } from './archive'
 import { Installer, type InstallResult, type PackageSource } from './installer'
-import { isExactVersion, isPackageName, pickVersion, PackageVersion, type PackageManifest, type Packument, Registry, RegistryError } from './registry'
-import { MarketSchema, type MarketSettings } from './settings'
+import { isExactVersion, isPackageName, pickVersion, PackageVersion, type PackageManifest, type Packument, Registries, RegistryError, type RegistryClient } from './registry'
+import { MarketSchema, registriesOf, type MarketSettings } from './settings'
 import { withLocalUpload } from './upload'
 import { matchesOrigin, type PluginOrigin } from './origin'
 
@@ -90,7 +90,7 @@ export class Market {
   private queue: Promise<unknown> = Promise.resolve()
 
   /** `root`: the plugin directory it installs into, as a real path */
-  constructor(private readonly ctx: Context, readonly registry: Registry, root: string, readonly catalog = new Catalog(registry)) {
+  constructor(private readonly ctx: Context, readonly registry: RegistryClient, root: string, readonly catalog = new Catalog(registry)) {
     this.installer = new Installer(registry, root, new Set(SHARED_SPECIFIERS))
   }
 
@@ -267,11 +267,12 @@ export class Market {
   }
 
   private async requestedVersion(name: string, ranges: string[]): Promise<PackageVersion> {
-    const document = await this.registry.packument(name, true)
-    if (document.name !== name) throw new MarketError(`npm 返回的包与请求的 ${name} 不符`)
-    const version = pickVersion(document, ranges[0] ?? 'latest', candidate =>
+    const accept = (candidate: PackageVersion) =>
       candidate.name === name && isExactVersion(candidate.version) && ranges.every(range => matchesPluginVersion(candidate.version, range))
-      && !this.incompatibility(candidate))
+      && !this.incompatibility(candidate)
+    const document = await this.registry.packument(name, true, document => !!pickVersion(document, ranges[0] ?? 'latest', accept))
+    if (document.name !== name) throw new MarketError(`npm 返回的包与请求的 ${name} 不符`)
+    const version = pickVersion(document, ranges[0] ?? 'latest', accept)
     if (!version) throw new MarketError(`${name} 没有满足当前 Bot 和插件依赖要求的 npm 版本`, 409)
     return version
   }
@@ -317,8 +318,10 @@ export class Market {
   }
 
   private async catalogVersion(entry: CatalogEntry, document?: Packument): Promise<PackageVersion> {
-    document ??= await this.registry.packument(entry.name, true)
-    const version = Object.hasOwn(document.versions, entry.version) ? document.versions[entry.version] : undefined
+    // A mirror may not have the version the catalog just pinned yet: then ask the next registry
+    const pinned = (document: Packument) => Object.hasOwn(document.versions ?? {}, entry.version)
+    if (!document || !pinned(document)) document = await this.registry.packument(entry.name, true, pinned)
+    const version = pinned(document) ? document.versions[entry.version] : undefined
     if (!version) throw new MarketError(`${entry.name}: catalog version ${entry.version} is unavailable from the npm registry`, 404)
     if (document.name !== entry.name || version.name !== entry.name || version.version !== entry.version) {
       throw new MarketError(`the registry returned a different package or version for ${entry.name}@${entry.version}`)
@@ -539,7 +542,7 @@ export function apply(ctx: Context, config: MarketSettings) {
   } catch {
     // created by the first install
   }
-  const registry = new Registry(config.registry, (url, init) => ctx.http.fetch(url, init))
+  const registry = new Registries(registriesOf(config), (url, init) => ctx.http.fetch(url, init))
   const market = new Market(ctx, registry, root, new Catalog(registry, config.catalog))
   market.cleanup().catch(e => ctx.logger('market').warn(e))
   ctx.inject(['webuiServer'], (ctx) => {

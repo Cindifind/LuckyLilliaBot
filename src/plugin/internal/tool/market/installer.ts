@@ -171,13 +171,15 @@ export class Installer {
         }
         const existing = lookup(node, dep.alias)
         if (existing && existing.source.manifest.name === spec.name && matches(existing.source.manifest.version, spec.range)) continue
-        const version = await packument(spec.name).then(
-          document => pickVersion(document, spec.range),
-          (e) => {
+        const version = await packument(spec.name)
+          // A mirror behind on this package: the registries after it may have a version that fits
+          .then(document => pickVersion(document, spec.range)
+            ?? this.registry.packument(spec.name, false, document => !!pickVersion(document, spec.range))
+              .then(document => pickVersion(document, spec.range)))
+          .catch((e) => {
             if (dep.optional) return undefined
             throw e
-          },
-        )
+          })
         if (!version || !fitsPlatform(version)) {
           if (dep.optional) {
             skipped.push(dep.alias)

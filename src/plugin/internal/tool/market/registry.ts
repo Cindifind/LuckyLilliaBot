@@ -34,8 +34,12 @@ export interface Packument {
 
 /** What the installer needs of a registry; tests give it one in memory */
 export interface RegistryClient {
-  /** `full`: the whole package.json of each version (custom fields like `llbot`), instead of what installs need */
-  packument(name: string, full?: boolean): Promise<Packument>
+  /**
+   * `full`: the whole package.json of each version (custom fields like `llbot`), instead of what installs need.
+   * `need`: what the document must contain, e.g. a version just published: with several registries, one that
+   * lacks it (a mirror not synced yet) is passed over for the next.
+   */
+  packument(name: string, full?: boolean, need?: (document: Packument) => boolean): Promise<Packument>
   /** Checked against `dist.integrity` / `dist.shasum` */
   tarball(version: PackageVersion, maxBytes?: number): Promise<Buffer>
 }
@@ -89,6 +93,90 @@ export class Registry implements RegistryClient {
 }
 
 const base = (url: string) => url.replace(/\/+$/, '')
+
+/** How long a registry that could not be reached is tried only after the others. */
+const RETRY_AFTER = 5 * 60_000
+
+/** No answer at all, or a server-side one: worth trying elsewhere first for a while, unlike a 404. */
+const unreachable = (error: RegistryError) => error.status === undefined || error.status === 429 || error.status >= 500
+
+/**
+ * Several registries in order of preference, e.g. a mirror and npm itself. Each request goes to the first that
+ * answers with what is needed; one that cannot be reached is tried last for a while, so a dead mirror does not
+ * cost a timeout on every request. Tarballs fall back to the same path on the other registries: their content
+ * is still checked against the integrity of the document they came from, so a mirror cannot substitute it.
+ */
+export class Registries implements RegistryClient {
+  readonly registries: readonly Registry[]
+  private readonly down = new Map<Registry, number>()
+
+  constructor(urls: readonly string[], fetch?: Fetch) {
+    const unique = [...new Set(urls.map(base))]
+    if (!unique.length) throw new Error('at least one npm registry is needed')
+    this.registries = unique.map(url => new Registry(url, fetch))
+  }
+
+  /** Configured order, with the ones that recently could not be reached moved to the end */
+  ordered(): Registry[] {
+    const now = Date.now()
+    const healthy = (registry: Registry) => !((this.down.get(registry) ?? 0) > now)
+    return [...this.registries.filter(healthy), ...this.registries.filter(registry => !healthy(registry))]
+  }
+
+  async packument(name: string, full = false, need?: (document: Packument) => boolean): Promise<Packument> {
+    const errors: RegistryError[] = []
+    let incomplete: Packument | undefined
+    for (const registry of this.ordered()) {
+      try {
+        const document = await registry.packument(name, full)
+        this.down.delete(registry)
+        if (!need || need(document)) return document
+        incomplete ??= document
+      } catch (e) {
+        errors.push(this.failed(registry, e))
+      }
+    }
+    // Nobody has what is needed: the first document lets the caller say what exactly is missing
+    if (incomplete) return incomplete
+    throw combine(errors)
+  }
+
+  async tarball(version: PackageVersion, maxBytes?: number): Promise<Buffer> {
+    const errors: RegistryError[] = []
+    for (const [url, registry] of this.tarballSources(version)) {
+      try {
+        return await registry.tarball({ ...version, dist: { ...version.dist, tarball: url } }, maxBytes)
+      } catch (e) {
+        // Unreachable, missing or corrupt there: the next registry may still have the right file
+        errors.push(this.failed(registry, e))
+      }
+    }
+    throw combine(errors)
+  }
+
+  /** The URL the document gave first, then the same path on each registry */
+  private tarballSources(version: PackageVersion): [string, Registry][] {
+    const original = version.dist.tarball
+    const owner = this.registries.find(registry => original.startsWith(registry.url + '/'))
+    const path = owner
+      ? original.slice(owner.url.length)
+      : `/${version.name}/-/${version.name.split('/').pop()}-${version.version}.tgz`
+    const sources = new Map<string, Registry>([[original, owner ?? this.ordered()[0]]])
+    for (const registry of this.ordered()) if (!sources.has(registry.url + path)) sources.set(registry.url + path, registry)
+    return [...sources]
+  }
+
+  private failed(registry: Registry, e: unknown): RegistryError {
+    const error = e instanceof RegistryError ? e : new RegistryError(e instanceof Error ? e.message : String(e))
+    if (unreachable(error)) this.down.set(registry, Date.now() + RETRY_AFTER)
+    return error
+  }
+}
+
+function combine(errors: RegistryError[]): RegistryError {
+  if (errors.length === 1) return errors[0]
+  return new RegistryError(errors.map(error => error.message).join('; '), errors.every(error => error.status === 404) ? 404 : undefined)
+}
 
 /** Catalog downloads have a small limit, enforced before buffering the entire response. */
 async function boundedBody(response: Response, maxBytes: number): Promise<Buffer> {

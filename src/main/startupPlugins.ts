@@ -3,8 +3,8 @@ import { realpathSync } from 'node:fs'
 import { Context } from 'cordis'
 import type { PluginStatus } from '@/plugin/host'
 import { Market } from '@/plugin/internal/tool/market/index'
-import { isPackageName, Registry } from '@/plugin/internal/tool/market/registry'
-import { MarketSchema, type MarketSettings } from '@/plugin/internal/tool/market/settings'
+import { isPackageName, Registries } from '@/plugin/internal/tool/market/registry'
+import { MarketSchema, registriesOf, type MarketSettings } from '@/plugin/internal/tool/market/settings'
 
 /** Only npm names: repeat --plugin, or put several comma-separated names in one value. */
 export function startupPluginNames(argv: readonly string[] = process.argv): string[] {
@@ -42,7 +42,7 @@ function installer(ctx: Context): RequestedInstaller {
   let root = path.resolve(first)
   try { root = realpathSync(root) } catch { /* the installer creates a missing root */ }
   const config = new MarketSchema(ctx.plugins.entrySettings('builtin:market')?.config as MarketSettings | undefined)
-  return new Market(ctx, new Registry(config.registry, (url, init) => ctx.http.fetch(url, init)), root)
+  return new Market(ctx, new Registries(registriesOf(config), (url, init) => ctx.http.fetch(url, init)), root)
 }
 
 /** CLI selection explicitly authorizes trust for requested packages and their required plugin dependencies. */
