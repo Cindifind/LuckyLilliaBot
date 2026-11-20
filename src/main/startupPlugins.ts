@@ -2,7 +2,7 @@ import path from 'node:path'
 import { realpathSync } from 'node:fs'
 import { Context } from 'cordis'
 import type { PluginStatus } from '@/plugin/host'
-import { Market } from '@/plugin/internal/tool/market'
+import { Market } from '@/plugin/internal/tool/market/index'
 import { isPackageName, Registry } from '@/plugin/internal/tool/market/registry'
 import { MarketSchema, type MarketSettings } from '@/plugin/internal/tool/market/settings'
 

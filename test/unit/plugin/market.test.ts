@@ -12,7 +12,7 @@ import { Hono } from 'hono'
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PluginCategory } from '@luckylillia/plugin-sdk'
 import PluginService from '@/plugin/host'
-import { createMarketRoutes, Market, MarketError } from '@/plugin/internal/tool/market'
+import { createMarketRoutes, Market, MarketError } from '@/plugin/internal/tool/market/index'
 import { readLocalPackage as readArchive } from '@/plugin/internal/tool/market/archive'
 import { Catalog } from '@/plugin/internal/tool/market/catalog'
 import {
